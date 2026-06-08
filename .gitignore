@@ -1,0 +1,20 @@
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# Python Cache
+__pycache__/
+*.pyc
+
+# Data & Databases
+local_qdrant/
+uploaded_docs/
+*.db
+*.sqlite3
+
+# Environment Variables
+.env
+
+# MacOS
+.DS_Store
