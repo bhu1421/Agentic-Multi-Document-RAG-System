@@ -16,3 +16,4 @@ GitPython==3.1.43
 wikipedia==1.4.0
 playwright==1.44.0
 nest_asyncio==1.6.0
+rank_bm25==0.2.2
