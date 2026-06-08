@@ -1,10 +1,22 @@
 import os
 from pathlib import Path
-from langchain_community.document_loaders import PyMuPDFLoader, TextLoader, UnstructuredMarkdownLoader
+from langchain_community.document_loaders import (
+    PyMuPDFLoader, 
+    TextLoader, 
+    UnstructuredMarkdownLoader,
+    UnstructuredWordDocumentLoader,
+    UnstructuredPowerPointLoader,
+    UnstructuredExcelLoader,
+    CSVLoader,
+    PlaywrightURLLoader,
+    GitLoader
+)
 
-# Create uploaded_docs dir
 DATA_DIR = Path("uploaded_docs")
 DATA_DIR.mkdir(exist_ok=True)
+
+CLONED_REPOS_DIR = Path("cloned_repos")
+CLONED_REPOS_DIR.mkdir(exist_ok=True)
 
 def load_documents(file_path: str):
     """Load a document based on its extension."""
@@ -16,12 +28,56 @@ def load_documents(file_path: str):
         elif ext == ".txt":
             loader = TextLoader(file_path, encoding="utf-8")
         elif ext == ".md":
-            loader = UnstructuredMarkdownLoader(file_path)
+            loader = UnstructuredMarkdownLoader(file_path, mode="elements", chunking_strategy="by_title")
+        elif ext in [".doc", ".docx"]:
+            loader = UnstructuredWordDocumentLoader(file_path, mode="elements", chunking_strategy="by_title")
+        elif ext in [".ppt", ".pptx"]:
+            loader = UnstructuredPowerPointLoader(file_path, mode="elements", chunking_strategy="by_title")
+        elif ext == ".xlsx":
+            loader = UnstructuredExcelLoader(file_path)
+        elif ext == ".csv":
+            loader = CSVLoader(file_path)
         else:
-            raise ValueError(f"Unsupported file extension: {ext}")
+            print(f"Skipping unsupported file extension: {ext}")
+            return []
             
-        docs = loader.load()
-        return docs
+        return loader.load()
     except Exception as e:
-        print(f"Error loading {file_path}: {e}")
+        print(f"Error loading file {file_path}: {e}")
+        return []
+
+def load_web_urls(urls: list[str]):
+    """Load documents from a list of website URLs."""
+    try:
+        import nest_asyncio
+        nest_asyncio.apply()
+        
+        # Use Playwright to render Javascript and strip out noisy menus/footers
+        loader = PlaywrightURLLoader(urls=urls, remove_selectors=["header", "footer", "nav", "aside"])
+        return loader.load()
+    except Exception as e:
+        print(f"Error loading web URLs: {e}")
+        return []
+
+def load_github_repo(repo_url: str):
+    """Clone a GitHub repo and load its text/md files."""
+    if not repo_url:
+        return []
+        
+    try:
+        repo_name = repo_url.rstrip("/").split("/")[-1]
+        if repo_name.endswith(".git"):
+            repo_name = repo_name[:-4]
+            
+        repo_path = str(CLONED_REPOS_DIR / repo_name)
+        
+        loader = GitLoader(
+            clone_url=repo_url,
+            repo_path=repo_path,
+            branch="main",
+            file_filter=lambda file_path: file_path.endswith((".py", ".md", ".txt"))
+        )
+        return loader.load()
+    except Exception as e:
+        print(f"Error loading GitHub Repo: {e}")
         return []
