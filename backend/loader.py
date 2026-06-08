@@ -2,13 +2,12 @@ import os
 from pathlib import Path
 from langchain_community.document_loaders import (
     PyMuPDFLoader, 
-    TextLoader, 
-    UnstructuredMarkdownLoader,
+    TextLoader,
     UnstructuredWordDocumentLoader,
     UnstructuredPowerPointLoader,
     UnstructuredExcelLoader,
     CSVLoader,
-    PlaywrightURLLoader,
+    AsyncChromiumLoader,
     GitLoader
 )
 
@@ -28,7 +27,7 @@ def load_documents(file_path: str):
         elif ext == ".txt":
             loader = TextLoader(file_path, encoding="utf-8")
         elif ext == ".md":
-            loader = UnstructuredMarkdownLoader(file_path, mode="elements", chunking_strategy="by_title")
+            loader = TextLoader(file_path, encoding="utf-8")
         elif ext in [".doc", ".docx"]:
             loader = UnstructuredWordDocumentLoader(file_path, mode="elements", chunking_strategy="by_title")
         elif ext in [".ppt", ".pptx"]:
@@ -52,8 +51,8 @@ def load_web_urls(urls: list[str]):
         import nest_asyncio
         nest_asyncio.apply()
         
-        # Use Playwright to render Javascript and strip out noisy menus/footers
-        loader = PlaywrightURLLoader(urls=urls, remove_selectors=["header", "footer", "nav", "aside"])
+        # Use AsyncChromiumLoader to render Javascript and return the raw HTML
+        loader = AsyncChromiumLoader(urls)
         return loader.load()
     except Exception as e:
         print(f"Error loading web URLs: {e}")
