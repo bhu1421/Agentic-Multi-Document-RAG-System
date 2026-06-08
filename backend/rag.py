@@ -9,9 +9,12 @@ from backend.vectordb import get_vector_store
 from langchain_community.tools import WikipediaQueryRun
 from langchain_community.utilities import WikipediaAPIWrapper
 
-from langchain.retrievers import EnsembleRetriever
 from langchain.retrievers.multi_query import MultiQueryRetriever
 from langchain_community.retrievers import BM25Retriever
+from langchain.retrievers.contextual_compression import ContextualCompressionRetriever
+from langchain.retrievers.document_compressors import CrossEncoderReranker
+from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+from langchain.retrievers import EnsembleRetriever
 
 def get_agentic_response(query: str):
     store = get_vector_store()
@@ -20,10 +23,10 @@ def get_agentic_response(query: str):
         
     llm = get_llm()
     
-    # Configure dense retriever with MMR
+    # Configure dense retriever with MMR (Retrieve 50)
     qdrant_retriever = store.as_retriever(
         search_type="mmr", 
-        search_kwargs={"k": 5, "fetch_k": 20}
+        search_kwargs={"k": 50, "fetch_k": 100}
     )
     
     # Dynamically rebuild BM25 index from Qdrant payloads
@@ -43,7 +46,7 @@ def get_agentic_response(query: str):
             all_docs.append(Document(page_content=content, metadata=metadata))
             
         bm25_retriever = BM25Retriever.from_documents(all_docs)
-        bm25_retriever.k = 5
+        bm25_retriever.k = 50
         
         # Reciprocal Rank Fusion (RRF) using EnsembleRetriever
         ensemble_retriever = EnsembleRetriever(
@@ -60,6 +63,14 @@ def get_agentic_response(query: str):
         llm=llm
     )
     
+    # 3. Reranking using CrossEncoder
+    bge_model = HuggingFaceCrossEncoder(model_name="BAAI/bge-reranker-large")
+    compressor = CrossEncoderReranker(model=bge_model, top_n=8)
+    compression_retriever = ContextualCompressionRetriever(
+        base_compressor=compressor,
+        base_retriever=multi_query_retriever
+    )
+    
     # 1. Local RAG Phase
     system_prompt = (
         "You are an expert assistant. Use the following pieces of retrieved context to answer the question.\n"
@@ -74,7 +85,7 @@ def get_agentic_response(query: str):
     ])
     
     qa_chain = create_stuff_documents_chain(llm, prompt)
-    rag_chain = create_retrieval_chain(multi_query_retriever, qa_chain)
+    rag_chain = create_retrieval_chain(compression_retriever, qa_chain)
     
     local_response = rag_chain.invoke({"input": query})
     answer = local_response["answer"].strip()
