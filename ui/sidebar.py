@@ -91,7 +91,12 @@ def render_sidebar():
                             display_name = source
                         else:
                             display_name = os.path.basename(source) if os.sep in source or "/" in source else source
-                        st.caption(f"📄 {display_name}")
+                        c1, c2 = st.columns([4, 1])
+                        c1.caption(f"📄 {display_name}")
+                        if c2.button("❌", key=f"del_{source}", help="Delete this source"):
+                            from backend.utils import delete_source_ui
+                            delete_source_ui(source)
+                            st.rerun()
                 else:
                     st.info("Collection is empty.")
         else:
@@ -100,24 +105,5 @@ def render_sidebar():
         st.markdown('<div class="custom-divider"></div>', unsafe_allow_html=True)
         
         # --- Clear Database ---
-        lock_file = os.path.join("local_qdrant", ".lock")
-        has_lock = os.path.exists(lock_file)
-        
         if st.button("🗑️ Clear Database", use_container_width=True):
-            if has_lock:
-                st.session_state["confirm_force_delete"] = True
-            else:
-                perform_clear()
-        
-        if st.session_state.get("confirm_force_delete"):
-            st.warning("⚠️ Database is locked! Force-delete will close the Qdrant connection.")
-            c1, c2 = st.columns(2)
-            with c1:
-                if st.button("✅ Force", use_container_width=True, type="primary"):
-                    st.session_state.pop("confirm_force_delete", None)
-                    force_close_qdrant()
-                    perform_clear()
-            with c2:
-                if st.button("❌ Cancel", use_container_width=True):
-                    st.session_state.pop("confirm_force_delete", None)
-                    st.rerun()
+            perform_clear()

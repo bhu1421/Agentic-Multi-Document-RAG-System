@@ -37,6 +37,10 @@ def force_close_qdrant():
 def perform_clear():
     """Clear all databases and uploaded files."""
     import shutil
+    
+    # Silently force close the Qdrant connection to release file locks before deleting
+    force_close_qdrant()
+    
     cleared = False
     for folder in ["local_qdrant", "uploaded_docs", "cloned_repos"]:
         if os.path.exists(folder):
@@ -49,6 +53,7 @@ def perform_clear():
                 st.error(f"Failed to clear {folder}: {e}")
                 
     if cleared:
+        st.cache_resource.clear()
         st.session_state.messages = []
         st.session_state.pop("confirm_force_delete", None)
         st.rerun()

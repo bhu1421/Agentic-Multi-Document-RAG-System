@@ -1,7 +1,7 @@
 import os
 import streamlit as st
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import Qdrant
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_qdrant import QdrantVectorStore
 
 # Local persistent Qdrant
 QDRANT_PATH = "local_qdrant"
@@ -23,26 +23,22 @@ def get_vector_store():
     """Get or create the Qdrant vector store."""
     embeddings = get_embeddings()
     client = get_qdrant_client()
-    return Qdrant(client=client, collection_name="rag_collection", embeddings=embeddings)
+    
+    try:
+        client.get_collection("rag_collection")
+    except Exception:
+        from qdrant_client.http.models import VectorParams, Distance
+        client.create_collection(
+            collection_name="rag_collection",
+            vectors_config=VectorParams(size=384, distance=Distance.COSINE)
+        )
+        
+    return QdrantVectorStore(client=client, collection_name="rag_collection", embedding=embeddings)
 
 def store_documents(chunks):
     """Store document chunks in Qdrant."""
     store = get_vector_store()
-    
-    # Check if collection exists, if not, it will be implicitly created by add_documents
-    try:
-        store.add_documents(chunks)
-    except Exception as e:
-        # If collection doesn't exist yet, we recreate the collection from documents
-        client = get_qdrant_client()
-        embeddings = get_embeddings()
-        Qdrant.from_documents(
-            chunks,
-            embeddings,
-            path=QDRANT_PATH,
-            collection_name="rag_collection"
-        )
-        st.cache_resource.clear()  # Clear cache so it re-initializes cleanly
+    store.add_documents(chunks)
     return store
 
 def get_indexed_sources():
