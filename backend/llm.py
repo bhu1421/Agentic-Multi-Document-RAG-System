@@ -12,6 +12,6 @@ def get_llm():
         
     return ChatGroq(
         api_key=api_key,
-        model_name="llama-3.1-8b-instant",  # Fallback fast model
+        model_name="llama-3.1-8b-instant",  # Fast model for routing and generation
         temperature=0.1
     )

@@ -40,7 +40,12 @@ def load_documents(file_path: str):
             print(f"Skipping unsupported file extension: {ext}")
             return []
             
-        return loader.load()
+        docs = loader.load()
+        # Clean up the 'source' metadata to just the filename so LLM routing matches exactly
+        for doc in docs:
+            if "source" in doc.metadata:
+                doc.metadata["source"] = os.path.basename(doc.metadata["source"])
+        return docs
     except Exception as e:
         print(f"Error loading file {file_path}: {e}")
         return []
