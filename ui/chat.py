@@ -16,7 +16,7 @@ def render_chat_interface():
     if "messages" not in st.session_state:
         st.session_state.messages = []
     
-    chat_container = st.container(height=520)
+    chat_container = st.container()
     
     with chat_container:
         if not st.session_state.messages:
@@ -63,7 +63,8 @@ def render_chat_interface():
                 
                 with st.spinner("🔍 Thinking..."):
                     try:
-                        response = get_agentic_response(prompt)
+                        chat_history = st.session_state.messages[:-1]
+                        response = get_agentic_response(prompt, chat_history)
                         
                         if not response:
                             st.warning("Upload sources or ask a general question.")

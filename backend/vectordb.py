@@ -13,36 +13,36 @@ def get_embeddings():
         model_kwargs={'device': 'cpu'}  # Force CPU to prevent meta tensor bugs
     )
 
+@st.cache_resource(show_spinner=False)
+def get_qdrant_client():
+    from qdrant_client import QdrantClient
+    os.makedirs(QDRANT_PATH, exist_ok=True)
+    return QdrantClient(path=QDRANT_PATH)
+
 def get_vector_store():
-    """Get or create the Qdrant vector store using MiniLM."""
+    """Get or create the Qdrant vector store."""
     embeddings = get_embeddings()
-    
-    # If the path doesn't exist, we must create a new store later
-    if not os.path.exists(QDRANT_PATH):
-        return None
-        
-    try:
-        store = Qdrant.from_existing_collection(
-            embedding=embeddings,
-            collection_name="rag_collection",
-            path=QDRANT_PATH
-        )
-        return store
-    except Exception as e:
-        print(f"Error loading collection: {e}")
-        return None
+    client = get_qdrant_client()
+    return Qdrant(client=client, collection_name="rag_collection", embeddings=embeddings)
 
 def store_documents(chunks):
     """Store document chunks in Qdrant."""
-    embeddings = get_embeddings()
+    store = get_vector_store()
     
-    store = Qdrant.from_documents(
-        chunks,
-        embeddings,
-        path=QDRANT_PATH,
-        collection_name="rag_collection",
-        force_recreate=False  # Do not recreate, append to existing DB
-    )
+    # Check if collection exists, if not, it will be implicitly created by add_documents
+    try:
+        store.add_documents(chunks)
+    except Exception as e:
+        # If collection doesn't exist yet, we recreate the collection from documents
+        client = get_qdrant_client()
+        embeddings = get_embeddings()
+        Qdrant.from_documents(
+            chunks,
+            embeddings,
+            path=QDRANT_PATH,
+            collection_name="rag_collection"
+        )
+        st.cache_resource.clear()  # Clear cache so it re-initializes cleanly
     return store
 
 def get_indexed_sources():
@@ -65,9 +65,13 @@ def get_indexed_sources():
             metadata = record.payload.get("metadata", {})
             source = metadata.get("source")
             if source:
-                # Clean up the path to just the filename (e.g., uploaded_docs\resume.pdf -> resume.pdf)
-                clean_source = os.path.basename(source)
-                sources.add(clean_source)
+                if str(source).startswith("http"):
+                    clean_source = source
+                else:
+                    # Clean up the path to just the filename (e.g., uploaded_docs\resume.pdf -> resume.pdf)
+                    clean_source = os.path.basename(source)
+                if clean_source:
+                    sources.add(clean_source)
         return sorted(list(sources))
     except Exception as e:
         print(f"Error in get_indexed_sources: {e}")

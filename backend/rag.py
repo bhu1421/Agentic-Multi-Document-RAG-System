@@ -11,18 +11,20 @@ from backend.llm import get_llm
 from backend.vectordb import get_vector_store, get_indexed_sources
 from backend.router import route_query
 from backend.retrieval import get_cached_docs, build_retrieval_pipeline
+from backend.memory import rewrite_query
 
-def _get_llm_response(query: str, llm) -> dict:
+def _get_llm_response(query: str, llm, history_str: str = "") -> dict:
     """Answer directly from the LLM's own knowledge."""
     prompt = ChatPromptTemplate.from_messages([
         ("system",
          "You are a friendly and knowledgeable AI assistant. "
          "Answer the user's question using your own general knowledge. "
-         "Be helpful, concise, and conversational."),
+         "Be helpful, concise, and conversational.\n\n"
+         "{history_str}"),
         ("human", "{input}"),
     ])
     chain = prompt | llm
-    answer = chain.invoke({"input": query})
+    answer = chain.invoke({"input": query, "history_str": history_str})
     return {
         "answer": answer.content,
         "context": [Document(
@@ -32,16 +34,24 @@ def _get_llm_response(query: str, llm) -> dict:
         "source_type": "llm_knowledge"
     }
 
-def get_agentic_response(query: str):
+def get_agentic_response(query: str, chat_history: list = None):
     """Orchestrates the full agentic RAG pipeline with intelligent query routing."""
     total_start = time.time()
     
     store = get_vector_store()
     llm = get_llm()
+    
+    # ── Memory: Rewrite query and format history ──
+    history_str = ""
+    search_query = query
+    if chat_history:
+        search_query = rewrite_query(query, chat_history, llm)
+        recent_history = chat_history[-10:]
+        history_str = "Chat History:\n" + "\n".join([f"{msg['role'].capitalize()}: {msg['content']}" for msg in recent_history]) + "\n\n"
 
     # ── No documents indexed at all → LLM knowledge only ──
     if not store:
-        return _get_llm_response(query, llm)
+        return _get_llm_response(query, llm, history_str)
 
     # ── Get indexed sources for routing decisions ──
     indexed_sources = get_indexed_sources()
@@ -49,16 +59,16 @@ def get_agentic_response(query: str):
     # ── No documents in collection → LLM knowledge only ──
     if not indexed_sources:
         print("[Router] No indexed sources found, using LLM knowledge")
-        result = _get_llm_response(query, llm)
+        result = _get_llm_response(query, llm, history_str)
         print(f"[Total] Completed in {time.time() - total_start:.1f}s (LLM knowledge — no docs)")
         return result
 
     # ── Route the query ──
-    route = route_query(query, llm, indexed_sources)
+    route = route_query(search_query, llm, indexed_sources)
 
     # ── Strategy 1: LLM Knowledge (skip retrieval entirely) ──
     if route["strategy"] == "llm_knowledge":
-        result = _get_llm_response(query, llm)
+        result = _get_llm_response(query, llm, history_str)
         print(f"[Total] Completed in {time.time() - total_start:.1f}s (LLM knowledge)")
         return result
 
@@ -75,6 +85,7 @@ def get_agentic_response(query: str):
         "You are an expert assistant. Use the following pieces of retrieved context to answer the question.\n"
         "You may also supplement the context with your own general knowledge to provide a more complete answer.\n"
         "If the context is completely irrelevant and you cannot answer at all, reply exactly with: WEB_SEARCH_REQUIRED\n\n"
+        "{history_str}"
         "Context:\n{context}"
     )
 
@@ -86,7 +97,7 @@ def get_agentic_response(query: str):
     qa_chain = create_stuff_documents_chain(llm, prompt)
     rag_chain = create_retrieval_chain(compression_retriever, qa_chain)
 
-    local_response = rag_chain.invoke({"input": query})
+    local_response = rag_chain.invoke({"input": search_query, "history_str": history_str})
     answer = local_response["answer"].strip()
 
     # ── Check for refusal → Wikipedia fallback ──
@@ -101,7 +112,7 @@ def get_agentic_response(query: str):
         search_tool = WikipediaQueryRun(api_wrapper=api_wrapper)
 
         try:
-            search_results = search_tool.invoke(query)
+            search_results = search_tool.invoke(search_query)
             if not search_results or "No good Wikipedia Search Result" in search_results:
                 search_results = "No results found on Wikipedia."
         except Exception as e:
@@ -110,12 +121,13 @@ def get_agentic_response(query: str):
         web_prompt = ChatPromptTemplate.from_messages([
             ("system",
              "You are an expert assistant. Answer the user's question using the "
-             "following Wikipedia search results:\n\n{search_results}"),
+             "following Wikipedia search results:\n\n{search_results}\n\n"
+             "{history_str}"),
             ("human", "{input}")
         ])
 
         web_chain = web_prompt | llm
-        final_answer = web_chain.invoke({"search_results": search_results, "input": query})
+        final_answer = web_chain.invoke({"search_results": search_results, "input": search_query, "history_str": history_str})
 
         print(f"[Total] Completed in {time.time() - total_start:.1f}s (Wikipedia fallback)")
         return {

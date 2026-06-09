@@ -11,6 +11,13 @@ def route_query(query: str, llm, indexed_sources: list) -> dict:
     """
     sources_list = "\n".join(f"- {s}" for s in indexed_sources) if indexed_sources else "- (none)"
 
+    # Hardcoded bypass for common LLM hallucinations
+    query_lower = query.lower()
+    if any(action in query_lower for action in ["analyse", "analyze", "summarize", "read"]) and \
+       any(target in query_lower for target in ["resume", "document", "file", "uploaded"]):
+        print(f"[Router] Query: '{query}' -> Hardcoded Decision: ALL_DOCS")
+        return {"strategy": "all_docs", "sources": []}
+
     router_prompt = ChatPromptTemplate.from_messages([
         ("system",
          "You are a query router for a RAG system. Classify the user's query "
@@ -40,7 +47,7 @@ def route_query(query: str, llm, indexed_sources: list) -> dict:
     router_chain = router_prompt | llm
     t = time.time()
     response = router_chain.invoke({"query": query}).content.strip()
-    print(f"[Router] Query: '{query}' → Decision: {response} ({time.time() - t:.1f}s)")
+    print(f"[Router] Query: '{query}' -> Decision: {response} ({time.time() - t:.1f}s)")
 
     response_clean = response.strip().upper()
 

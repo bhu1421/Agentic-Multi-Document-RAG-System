@@ -87,7 +87,10 @@ def render_sidebar():
                 indexed_sources = get_indexed_sources_ui()
                 if indexed_sources:
                     for source in indexed_sources:
-                        display_name = os.path.basename(source) if os.sep in source or "/" in source else source
+                        if str(source).startswith("http"):
+                            display_name = source
+                        else:
+                            display_name = os.path.basename(source) if os.sep in source or "/" in source else source
                         st.caption(f"📄 {display_name}")
                 else:
                     st.info("Collection is empty.")
