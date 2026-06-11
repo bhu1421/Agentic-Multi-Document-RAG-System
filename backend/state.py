@@ -10,8 +10,23 @@ class AgentState(TypedDict):
     # Planner output
     tasks: List[str]
     
-    # Retriever output. We use `operator.add` so that multiple tasks can append documents to the same state list concurrently if needed.
-    retrieved_docs: Annotated[List[Document], operator.add]
+    # Query Expansion output
+    expanded_queries: List[str]
+    
+    # Metadata Filter output
+    metadata_filters: dict
+    
+    # Retriever output.
+    retrieved_docs: List[Document]
+    
+    # Web Search results (kept separate until Evidence Fusion merges them)
+    web_docs: List[Document]
+    
+    # Evidence Fusion output
+    fused_docs: List[Document]
+    
+    # Reranker output (final ranked evidence for the Answer agent)
+    reranked_docs: List[Document]
     
     # Router output
     strategy: str

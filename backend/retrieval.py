@@ -60,12 +60,56 @@ def get_cached_docs(store):
     
     return _bm25_docs_cache
 
+
+def _build_qdrant_filter(target_sources=None, metadata_filters=None):
+    """Build a Qdrant Filter combining source targets and metadata conditions.
+
+    Source targets use a `should` (OR) filter — match ANY of the listed sources.
+    Metadata conditions use `must` (AND) — ALL conditions must match.
+    Both are wrapped in a top-level `must` so they combine with AND semantics.
+    """
+    must_conditions = []
+
+    # Source filter (OR: match any of these sources)
+    if target_sources:
+        source_filter = models.Filter(
+            should=[
+                models.FieldCondition(
+                    key="metadata.source",
+                    match=models.MatchValue(value=src)
+                )
+                for src in target_sources
+            ]
+        )
+        must_conditions.append(source_filter)
+
+    # Metadata filters (AND: all must match)
+    if metadata_filters:
+        for key, value in metadata_filters.items():
+            if key == "source" or value is None:
+                continue  # source is handled above
+            must_conditions.append(
+                models.FieldCondition(
+                    key=f"metadata.{key}",
+                    match=models.MatchValue(value=value)
+                )
+            )
+
+    if must_conditions:
+        return models.Filter(must=must_conditions)
+    return None
+
+
 class CustomHybridRetriever:
-    """A highly stable, custom implementation of Reciprocal Rank Fusion (Ensemble) + CrossEncoder Reranking."""
-    def __init__(self, qdrant_retriever, bm25_retriever, reranker, top_k=8):
+    """Custom Reciprocal Rank Fusion (Ensemble) retriever.
+
+    Combines dense (Qdrant MMR) and sparse (BM25) results via RRF.
+    Reranking is now handled by a separate graph node, so this class
+    only performs retrieval and fusion.
+    """
+    def __init__(self, qdrant_retriever, bm25_retriever, top_k=15):
         self.qdrant_retriever = qdrant_retriever
         self.bm25_retriever = bm25_retriever
-        self.reranker = reranker
         self.top_k = top_k
 
     def _rrf(self, doc_lists, k=60):
@@ -96,38 +140,32 @@ class CustomHybridRetriever:
             fused_docs = self._rrf([qdrant_docs, bm25_docs])
         else:
             fused_docs = qdrant_docs
-            
-        if not fused_docs or not self.reranker:
-            return fused_docs[:self.top_k]
-            
-        # 4. Rerank using CrossEncoder
-        pairs = [[query, doc.page_content] for doc in fused_docs]
-        scores = self.reranker.score(pairs)
-        
-        scored_docs = list(zip(fused_docs, scores))
-        scored_docs.sort(key=lambda x: x[1], reverse=True)
-        
-        # Return top_k
-        return [doc for doc, score in scored_docs[:self.top_k]]
 
-def build_retrieval_pipeline(store, llm, all_docs, target_sources=None):
-    """Build the full retrieval pipeline (BM25 + Qdrant → Rerank)."""
+        # Return top_k — reranking is handled downstream by the Reranker node
+        return fused_docs[:self.top_k]
+
+
+def build_retrieval_pipeline(store, llm, all_docs, target_sources=None, metadata_filters=None):
+    """Build the full retrieval pipeline (BM25 + Qdrant → RRF).
+
+    Reranking has been extracted to a standalone graph node so it can
+    operate on the full fused evidence (local + web + metadata-filtered).
+
+    Args:
+        store: Qdrant vector store instance.
+        llm: Language model (unused here, kept for API compatibility).
+        all_docs: Full list of cached documents for BM25.
+        target_sources: List of source filenames to restrict search to.
+        metadata_filters: Dict of metadata field conditions (file_type, page, section).
+    """
     # --- Dense Retriever (Qdrant MMR) ---
     search_kwargs = {"k": 30, "fetch_k": 60}
 
-    if target_sources:
-        # Apply Qdrant metadata filter to restrict to specific sources
-        source_filter = models.Filter(
-            should=[
-                models.FieldCondition(
-                    key="metadata.source",
-                    match=models.MatchValue(value=src)
-                )
-                for src in target_sources
-            ]
-        )
-        search_kwargs["filter"] = source_filter
-        print(f"[Retriever] Filtering to sources: {target_sources}")
+    # Build combined Qdrant filter from sources + metadata
+    qdrant_filter = _build_qdrant_filter(target_sources, metadata_filters)
+    if qdrant_filter:
+        search_kwargs["filter"] = qdrant_filter
+        print(f"[Retriever] Qdrant filter applied: sources={target_sources}, metadata={metadata_filters}")
 
     qdrant_retriever = store.as_retriever(
         search_type="mmr",
@@ -137,10 +175,20 @@ def build_retrieval_pipeline(store, llm, all_docs, target_sources=None):
     # --- Sparse Retriever (BM25) ---
     bm25_retriever = None
     try:
+        # Filter BM25 docs by source
         if target_sources:
             filtered_docs = [d for d in all_docs if d.metadata.get("source") in target_sources]
         else:
             filtered_docs = all_docs
+
+        # Also apply metadata filters to BM25 docs (string comparison for type safety)
+        if metadata_filters:
+            for key, value in metadata_filters.items():
+                if key != "source" and value is not None:
+                    filtered_docs = [
+                        d for d in filtered_docs
+                        if str(d.metadata.get(key, "")) == str(value)
+                    ]
 
         if filtered_docs:
             bm25_retriever = BM25Retriever.from_documents(filtered_docs)
@@ -148,13 +196,9 @@ def build_retrieval_pipeline(store, llm, all_docs, target_sources=None):
     except Exception as e:
         print(f"[BM25] Initialization failed, falling back to Qdrant only: {e}")
 
-    # --- Reranking (BAAI/bge-reranker-large → top 8, CACHED model) ---
-    reranker = get_reranker()
-    
-    # Return Custom Pipeline
+    # Return pipeline — reranking happens in the standalone Reranker node
     return CustomHybridRetriever(
         qdrant_retriever=qdrant_retriever,
         bm25_retriever=bm25_retriever,
-        reranker=reranker,
-        top_k=8
+        top_k=15  # Return more candidates; Reranker will narrow to top 8
     )

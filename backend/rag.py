@@ -11,11 +11,17 @@ def get_agentic_response(query: str, chat_history: list = None):
         "query": query,
         "chat_history": chat_history or [],
         "tasks": [],
+        "expanded_queries": [],
+        "metadata_filters": {},
         "retrieved_docs": [],
+        "web_docs": [],
+        "fused_docs": [],
+        "reranked_docs": [],
         "answer": "",
         "strategy": "",
         "target_sources": [],
-        "source_type": ""
+        "source_type": "",
+        "needs_web_search": False
     }
     
     try:
@@ -27,7 +33,14 @@ def get_agentic_response(query: str, chat_history: list = None):
         
     answer = final_state.get("answer", "I couldn't generate an answer.")
     source_type = final_state.get("source_type", "local")
-    docs = final_state.get("retrieved_docs", [])
+
+    # Use reranked docs for source citations; fall back gracefully
+    docs = (
+        final_state.get("reranked_docs")
+        or final_state.get("fused_docs")
+        or final_state.get("retrieved_docs")
+        or []
+    )
     
     print(f"[Total] Completed in {time.time() - total_start:.1f}s ({source_type})")
     
