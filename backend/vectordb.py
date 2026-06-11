@@ -1,7 +1,7 @@
 import os
 import streamlit as st
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_qdrant import QdrantVectorStore
+from langchain_qdrant import Qdrant
 
 # Local persistent Qdrant
 QDRANT_PATH = "local_qdrant"
@@ -33,7 +33,7 @@ def get_vector_store():
             vectors_config=VectorParams(size=384, distance=Distance.COSINE)
         )
         
-    return QdrantVectorStore(client=client, collection_name="rag_collection", embedding=embeddings)
+    return Qdrant(client=client, collection_name="rag_collection", embeddings=embeddings)
 
 def store_documents(chunks):
     """Store document chunks in Qdrant."""

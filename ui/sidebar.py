@@ -104,6 +104,27 @@ def render_sidebar():
         
         st.markdown('<div class="custom-divider"></div>', unsafe_allow_html=True)
         
+        # --- Observability ---
+        st.markdown("#### 🔭 Observability")
+        env_api_key = os.getenv("LANGCHAIN_API_KEY", "")
+        ls_api_key = st.text_input("LangSmith API Key", value=env_api_key if env_api_key else "", type="password", help="Enter your LangSmith API key")
+        
+        tracing_enabled = st.toggle("Enable LangSmith Tracing", value=False)
+        
+        if ls_api_key and tracing_enabled:
+            os.environ["LANGCHAIN_TRACING_V2"] = "true"
+            os.environ["LANGCHAIN_API_KEY"] = ls_api_key
+            if "LANGCHAIN_PROJECT" not in os.environ:
+                os.environ["LANGCHAIN_PROJECT"] = "Agentic_RAG_System"
+            st.caption("✅ Tracing Active")
+        elif not ls_api_key and tracing_enabled:
+            os.environ["LANGCHAIN_TRACING_V2"] = "false"
+            st.caption("⚠️ Cannot enable tracing without an API Key.")
+        else:
+            os.environ["LANGCHAIN_TRACING_V2"] = "false"
+            st.caption("⏸️ Tracing paused.")
+        
+        st.markdown('<div class="custom-divider"></div>', unsafe_allow_html=True)        
         # --- Clear Database ---
         if st.button("🗑️ Clear Database", use_container_width=True):
             perform_clear()

@@ -95,7 +95,8 @@ def render_chat_interface():
                             st.session_state.messages.append({
                                 "role": "assistant",
                                 "content": answer,
-                                "source_badge": badge_text
+                                "source_badge": badge_text,
+                                "context": response.get("context", [])
                             })
                     except Exception as e:
                         st.error(f"Error: {e}")

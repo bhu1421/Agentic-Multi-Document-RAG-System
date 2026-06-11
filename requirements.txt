@@ -17,6 +17,9 @@ wikipedia==1.4.0
 playwright==1.44.0
 nest_asyncio==1.6.0
 rank_bm25==0.2.2
-langgraph==0.0.60
-langchain-huggingface==0.0.3
-langchain-qdrant==0.1.0
+langgraph
+langchain-huggingface
+langchain-qdrant
+ragas
+datasets
+langsmith

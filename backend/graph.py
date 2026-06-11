@@ -26,7 +26,7 @@ def router_node(state: AgentState):
 def route_after_router(state: AgentState):
     """Route directly to answer if LLM knowledge is sufficient, else planner."""
     if state.get("strategy") == "llm_knowledge":
-        return "answer"
+        return "generate_answer"
     return "planner"
 
 # ──────────────────────────────────────────────
@@ -344,14 +344,14 @@ workflow.add_node("reflection", reflection_node)
 workflow.add_node("web_search", web_search_node)
 workflow.add_node("evidence_fusion", evidence_fusion_node)
 workflow.add_node("reranker", reranker_node)
-workflow.add_node("answer", answer_node)
+workflow.add_node("generate_answer", answer_node)
 
 # Linear edges
 workflow.add_edge(START, "router")
 workflow.add_conditional_edges(
     "router",
     route_after_router,
-    {"planner": "planner", "answer": "answer"}
+    {"planner": "planner", "generate_answer": "generate_answer"}
 )
 workflow.add_edge("planner", "query_expansion")
 workflow.add_edge("query_expansion", "metadata_filter")
@@ -368,8 +368,8 @@ workflow.add_conditional_edges(
 # Both paths converge at evidence_fusion
 workflow.add_edge("web_search", "evidence_fusion")
 workflow.add_edge("evidence_fusion", "reranker")
-workflow.add_edge("reranker", "answer")
-workflow.add_edge("answer", END)
+workflow.add_edge("reranker", "generate_answer")
+workflow.add_edge("generate_answer", END)
 
 # Compile with MemorySaver to enable Persistence
 memory = MemorySaver()
