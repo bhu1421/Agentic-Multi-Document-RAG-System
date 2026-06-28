@@ -127,20 +127,20 @@ def retriever_node(state: AgentState):
 # Node 3 — Web Search (Fallback)
 # ──────────────────────────────────────────────
 def web_search_node(state: AgentState):
-    """Use DuckDuckGo to search the web for external or time-sensitive knowledge."""
-    from langchain_community.tools import DuckDuckGoSearchResults
+    """Use Tavily to search the web for external or time-sensitive knowledge."""
+    from langchain_community.tools.tavily_search import TavilySearchResults
     from langchain_core.documents import Document
 
     t = time.time()
     query = state["query"]
-    search = DuckDuckGoSearchResults()
+    search = TavilySearchResults(max_results=3)
 
     try:
-        results = search.invoke(query)
+        results = search.invoke({"query": query})
         logger.info("[WebSearch] Fetched results in %.1fs", time.time() - t)
         doc = Document(
             page_content=f"Web Search Results:\n{results}",
-            metadata={"source": "duckduckgo_web_search", "origin": "web", "file_type": "web"},
+            metadata={"source": "tavily_web_search", "origin": "web", "file_type": "web"},
         )
         source_type = "hybrid_web" if state.get("source_type") != "web_search" else "web"
         return {
