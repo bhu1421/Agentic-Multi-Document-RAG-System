@@ -1,376 +1,308 @@
 import time
-import json
+import functools
+from datetime import datetime
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.memory import MemorySaver
 from backend.state import AgentState
+from backend import config
 from backend.llm import get_llm
 from backend.vectordb import get_vector_store, get_indexed_sources
 from backend.router import route_query
-from backend.retrieval import get_cached_docs, get_reranker, build_retrieval_pipeline
+from backend.retrieval import (
+    build_retrieval_pipeline,
+    expand_to_parent_context,
+    get_reranker,
+    should_use_reranker,
+)
+from backend.logger import get_logger
+
+logger = get_logger(__name__)
+
 
 # ──────────────────────────────────────────────
-# Node 0 — Router (NEW)
+# Node 1 — Router
 # ──────────────────────────────────────────────
 def router_node(state: AgentState):
-    """Classify the query to determine if we need retrieval or can answer directly."""
+    """Classify the query to determine the best retrieval strategy.
+
+    Uses LLM structured output (RouterDecision Pydantic model) to return
+    one of: llm_knowledge | web_search | targeted_search | all_docs.
+    """
+    t = time.time()
     llm = get_llm()
-    indexed_sources = get_indexed_sources()
-    route = route_query(state["query"], llm, indexed_sources)
+    indexed_sources = get_indexed_sources(state.get("user_id"))
+    query = state["query"]
+    route = route_query(query, llm, indexed_sources)
+    elapsed = round(time.time() - t, 2)
+
     return {
-        "strategy": route["strategy"],
+        "strategy":       route["strategy"],
         "target_sources": route.get("sources", []),
-        "source_type": route["strategy"] if route["strategy"] == "targeted_search" else "local"
+        "source_type":    route["strategy"] if route["strategy"] in {
+            "llm_knowledge", "targeted_search", "web_search"
+        } else "local",
+        # Accumulate timings: read existing dict, add our entry, return merged dict.
+        # LangGraph replaces keys on merge, so we must preserve prior entries manually.
+        "timings": {**state.get("timings", {}), "router": elapsed},
     }
 
+
 def route_after_router(state: AgentState):
-    """Route directly to answer if LLM knowledge is sufficient, else planner."""
-    if state.get("strategy") == "llm_knowledge":
+    """Conditional edge: decide the next node after routing."""
+    strategy = state.get("strategy")
+    if strategy == "llm_knowledge":
         return "generate_answer"
-    return "planner"
-
-# ──────────────────────────────────────────────
-# Node 1 — Planner
-# ──────────────────────────────────────────────
-def planner_node(state: AgentState):
-    """Determine the retrieval tasks needed to answer the query."""
-    llm = get_llm()
-    query = state["query"]
-    chat_history = state.get("chat_history", [])
-    
-    # Rewrite the query to be context-aware using chat history
-    from backend.memory import rewrite_query
-    if chat_history:
-        query = rewrite_query(query, chat_history, llm)
-    
-    # Simple Planner Prompt
-    planner_prompt = ChatPromptTemplate.from_messages([
-        ("system",
-         "You are a planner for a RAG system. Your job is to break down the user's query "
-         "into a JSON list of independent retrieval tasks. \n\n"
-         "For simple queries, output a list with one task. For complex queries (e.g. comparing two things), "
-         "output multiple tasks.\n\n"
-         "Output ONLY valid JSON representing a list of strings, e.g., [\"Task 1\", \"Task 2\"]. "
-         "Do not include markdown blocks or any other text."),
-        ("human", "Query: {query}")
-    ])
-    
-    t = time.time()
-    response = (planner_prompt | llm).invoke({"query": query}).content.strip()
-    print(f"[Planner] Generated tasks in {time.time() - t:.1f}s: {response}")
-    
-    try:
-        if response.startswith("```json"):
-            response = response.replace("```json", "").replace("```", "").strip()
-        tasks = json.loads(response)
-        if not isinstance(tasks, list):
-            tasks = [query]
-    except Exception as e:
-        print(f"[Planner] Failed to parse JSON, falling back to original query. Error: {e}")
-        tasks = [query]
-        
-    return {"query": query, "tasks": tasks}
+    if strategy == "web_search":
+        return "web_search"
+    return "retriever"
 
 
 # ──────────────────────────────────────────────
-# Node 2 — Query Expansion  (NEW)
-# ──────────────────────────────────────────────
-from backend.agents.query_expansion import query_expansion_node
-
-
-# ──────────────────────────────────────────────
-# Node 3 — Metadata Filter  (NEW)
-# ──────────────────────────────────────────────
-from backend.agents.metadata_filter import metadata_filter_node
-
-
-# ──────────────────────────────────────────────
-# Node 4 — Retriever  (UPDATED)
+# Node 2 — Retriever (MMR + Hierarchical + Rerank)
 # ──────────────────────────────────────────────
 def retriever_node(state: AgentState):
-    """Execute the retrieval pipeline using expanded queries and metadata filters."""
-    llm = get_llm()
+    """Execute dense retrieval, hierarchical parent expansion, and optional reranking.
+
+    Pipeline:
+    1. MMR search in Qdrant → top config.TOP_K candidate chunks
+    2. Hierarchical expansion → fetch all siblings of matched parent documents
+    3. Cross-encoder reranking → re-score expanded chunks, keep top config.MAX_RERANKED
+    """
+    t = time.time()
     store = get_vector_store()
-    indexed_sources = get_indexed_sources()
+    if not store:
+        logger.info("[Retriever] Database is empty.")
+        return {
+            "retrieved_docs": [],
+            "source_type": "llm_knowledge",
+            "timings": {**state.get("timings", {}), "retriever": round(time.time() - t, 2)},
+        }
 
-    # Use expanded queries if available, otherwise fall back to tasks or raw query
-    expanded_queries = state.get("expanded_queries") or state.get("tasks") or [state["query"]]
-    metadata_filters = state.get("metadata_filters") or {}
-    
-    if not store or not indexed_sources:
-        print("[Retriever] Database is empty, skipping retrieval.")
-        return {"retrieved_docs": [], "source_type": "llm_knowledge"}
-    
-    all_docs = get_cached_docs(store)
-    
-    # Strategy is already determined by router_node
-    strategy = state.get("strategy", "all_docs")
-    if strategy == "llm_knowledge":
-        return {"retrieved_docs": [], "source_type": "llm_knowledge"}
-    
-    # Start with router's source targets
-    target_sources = state.get("target_sources")
-    source_type = state.get("source_type", "local")
-    
-    # If Metadata Filter extracted a source, validate and use it
-    if "source" in metadata_filters:
-        meta_source = metadata_filters["source"]
-        indexed_lower = {s.lower(): s for s in indexed_sources}
-        if meta_source.lower() in indexed_lower:
-            target_sources = [indexed_lower[meta_source.lower()]]
-            source_type = "targeted_search"
-            print(f"[Retriever] Metadata filter overriding source to: {target_sources}")
-
-    # Build the pipeline ONCE with combined filters
-    pipeline = build_retrieval_pipeline(store, llm, all_docs, target_sources, metadata_filters)
-    
-    # Search with EVERY expanded query to maximise recall
-    all_retrieved_docs = []
-    for eq in expanded_queries:
-        t = time.time()
-        docs = pipeline.invoke(eq)
-        print(f"[Retriever] Retrieved {len(docs)} docs for '{eq}' ({time.time() - t:.1f}s)")
-        all_retrieved_docs.extend(docs)
-        
-    # Deduplicate documents based on chunk_id or content prefix
-    seen = set()
-    unique_docs = []
-    for doc in all_retrieved_docs:
-        identifier = doc.metadata.get("chunk_id", doc.page_content[:200])
-        if identifier not in seen:
-            seen.add(identifier)
-            unique_docs.append(doc)
-
-    print(f"[Retriever] Total: {len(all_retrieved_docs)} raw -> {len(unique_docs)} unique docs")
-    return {"retrieved_docs": unique_docs, "source_type": source_type}
-
-
-# ──────────────────────────────────────────────
-# Node 5 — Reflection
-# ──────────────────────────────────────────────
-def reflection_node(state: AgentState):
-    """Reflect on retrieved docs to determine if web search is needed."""
-    llm = get_llm()
     query = state["query"]
-    docs = state["retrieved_docs"]
-    
-    # If router decided this is an LLM-knowledge query (e.g. greetings),
-    # don't trigger web search — just go straight to answer.
-    if state.get("source_type") == "llm_knowledge":
-        print("[Reflection] LLM knowledge query, skipping web search.")
-        return {"needs_web_search": False}
-    
-    if not docs:
-        print("[Reflection] No documents retrieved, web search needed.")
-        return {"needs_web_search": True}
-        
-    # Format the combined context and truncate to protect LLM token limits
-    context = "\n\n".join([doc.page_content for doc in docs])
-    if len(context) > 12000:
-        context = context[:12000] + "\n...[Context truncated due to length]..."
-    
-    prompt = ChatPromptTemplate.from_messages([
-        ("system",
-         "You are a critical evaluator for a RAG system. Your job is to determine if the retrieved context "
-         "contains sufficient evidence to answer the user's query.\n\n"
-         "If the context contains the answer, output 'YES'.\n"
-         "If the context is completely irrelevant or missing key information to answer the query, output 'NO'.\n"
-         "Output ONLY 'YES' or 'NO'. Do not output any other text."),
-        ("human", "Query: {query}\n\nContext:\n{context}")
-    ])
-    
-    response = (prompt | llm).invoke({"query": query, "context": context}).content.strip().upper()
-    needs_search = "NO" in response
-    
-    print(f"[Reflection] Evidence sufficient? {'No (Needs Web Search)' if needs_search else 'Yes'}")
-    return {"needs_web_search": needs_search}
+    target_sources = state.get("target_sources") or None
+    source_type = state.get("source_type", "local")
+
+    pipeline = build_retrieval_pipeline(store, target_sources, None)
+
+    t_search = time.time()
+    raw_docs = pipeline.invoke(query)
+    logger.debug("[Retriever] Qdrant matched %d docs in %.1fs", len(raw_docs), time.time() - t_search)
+
+    expanded_docs = expand_to_parent_context(raw_docs, store, user_id=state.get("user_id"))
+
+    if not expanded_docs:
+        return {
+            "retrieved_docs": [],
+            "source_type": source_type,
+            "timings": {**state.get("timings", {}), "retriever": round(time.time() - t, 2)},
+        }
+
+    if not should_use_reranker():
+        top_docs = expanded_docs[:config.MAX_RERANKED]
+        logger.info("[Retriever] Reranker disabled; using top %d docs", len(top_docs))
+        return {
+            "retrieved_docs": top_docs,
+            "source_type": source_type,
+            "timings": {**state.get("timings", {}), "retriever": round(time.time() - t, 2)},
+        }
+
+    reranker = get_reranker()
+    pairs = [[query, doc.page_content] for doc in expanded_docs]
+    scores = reranker.score(pairs)
+    scored_docs = sorted(zip(expanded_docs, scores), key=lambda x: x[1], reverse=True)
+    top_docs = [doc for doc, _ in scored_docs[:config.MAX_RERANKED]]
+    logger.info(
+        "[Retriever] Reranked %d expanded chunks → top %d in %.1fs",
+        len(expanded_docs), len(top_docs), time.time() - t,
+    )
+
+    return {
+        "retrieved_docs": top_docs,
+        "source_type": source_type,
+        "timings": {**state.get("timings", {}), "retriever": round(time.time() - t, 2)},
+    }
 
 
 # ──────────────────────────────────────────────
-# Node 6 — Web Search
+# Node 3 — Web Search (Fallback)
 # ──────────────────────────────────────────────
 def web_search_node(state: AgentState):
-    """Use DuckDuckGo to search the web for external knowledge.
-
-    Results are stored in `web_docs` (separate from `retrieved_docs`)
-    so that Evidence Fusion can tag provenance before merging.
-    """
+    """Use DuckDuckGo to search the web for external or time-sensitive knowledge."""
     from langchain_community.tools import DuckDuckGoSearchResults
     from langchain_core.documents import Document
-    
+
+    t = time.time()
     query = state["query"]
     search = DuckDuckGoSearchResults()
-    
-    t = time.time()
+
     try:
         results = search.invoke(query)
-        print(f"[WebSearch] Fetched web results in {time.time() - t:.1f}s")
+        logger.info("[WebSearch] Fetched results in %.1fs", time.time() - t)
         doc = Document(
             page_content=f"Web Search Results:\n{results}",
-            metadata={
-                "source": "duckduckgo_web_search",
-                "origin": "web",
-                "file_type": "web"
-            }
+            metadata={"source": "duckduckgo_web_search", "origin": "web", "file_type": "web"},
         )
-        return {"web_docs": [doc], "source_type": "hybrid_web"}
-    except Exception as e:
-        print(f"[WebSearch] Search failed: {e}")
-        return {"web_docs": []}
+        source_type = "hybrid_web" if state.get("source_type") != "web_search" else "web"
+        return {
+            "retrieved_docs": [doc],
+            "source_type": source_type,
+            "web_search_attempted": True,
+            "timings": {**state.get("timings", {}), "web_search": round(time.time() - t, 2)},
+        }
+    except Exception as exc:
+        logger.warning("[WebSearch] Search failed: %s", exc)
+        source_type = "hybrid_web" if state.get("source_type") != "web_search" else "web"
+        return {
+            "retrieved_docs": [],
+            "source_type": source_type,
+            "web_search_attempted": True,
+            "timings": {**state.get("timings", {}), "web_search": round(time.time() - t, 2)},
+        }
 
 
 # ──────────────────────────────────────────────
-# Node 7 — Evidence Fusion  (NEW)
-# ──────────────────────────────────────────────
-from backend.agents.evidence_fusion import evidence_fusion_node
-
-
-# ──────────────────────────────────────────────
-# Node 8 — Reranker  (EXTRACTED from retrieval.py)
-# ──────────────────────────────────────────────
-def reranker_node(state: AgentState):
-    """Rerank all fused evidence using the BAAI cross-encoder.
-
-    Operates on the full fused evidence (local + web + metadata-filtered)
-    instead of only local results, producing a final top-8 ranking.
-    """
-    docs = state.get("fused_docs", [])
-    query = state["query"]
-    
-    if not docs:
-        print("[Reranker] No documents to rerank")
-        return {"reranked_docs": []}
-    
-    reranker = get_reranker()
-    
-    t = time.time()
-    pairs = [[query, doc.page_content] for doc in docs]
-    scores = reranker.score(pairs)
-    
-    scored_docs = list(zip(docs, scores))
-    scored_docs.sort(key=lambda x: x[1], reverse=True)
-    
-    top_docs = [doc for doc, score in scored_docs[:8]]
-    
-    print(f"[Reranker] Reranked {len(docs)} docs -> top {len(top_docs)} ({time.time() - t:.1f}s)")
-    return {"reranked_docs": top_docs}
-
-
-# ──────────────────────────────────────────────
-# Node 9 — Answer
+# Node 4 — Generate Answer
 # ──────────────────────────────────────────────
 def answer_node(state: AgentState):
-    """Generate the final answer based on reranked evidence."""
+    """Generate the final answer based on retrieved evidence.
+
+    Hallucination guard: when using local documents, the prompt instructs the
+    LLM to output exactly 'INSUFFICIENT_CONTEXT' if the retrieved chunks do not
+    contain the answer.  The graph then routes to a web search fallback.
+    """
+    t = time.time()
     llm = get_llm()
     query = state["query"]
     chat_history = state.get("chat_history", [])
+    docs = state.get("retrieved_docs", [])
 
-    # Use reranked docs first; fall back to fused, then retrieved
-    docs = (
-        state.get("reranked_docs")
-        or state.get("fused_docs")
-        or state.get("retrieved_docs")
-        or []
-    )
-    
+    history_str = (
+        "Chat History:\n"
+        + "\n".join([
+            f"{m['role'].capitalize()}: {m['content']}"
+            for m in chat_history[-config.CHAT_HISTORY_WINDOW:]
+        ])
+        + "\n\n"
+    ) if chat_history else ""
+
+    # ── No documents retrieved → answer from LLM knowledge ───────────────────
     if not docs:
-        print("[Answer] No documents retrieved, falling back to LLM knowledge.")
-        history_str = "Chat History:\n" + "\n".join([f"{msg['role'].capitalize()}: {msg['content']}" for msg in chat_history[-10:]]) + "\n\n" if chat_history else ""
+        current_date = datetime.now().strftime("%B %d, %Y")
+        logger.info("[Answer] No docs — using LLM knowledge.")
         prompt = ChatPromptTemplate.from_messages([
-            ("system",
-             "You are a friendly AI assistant. Answer the user's question using your own general knowledge. "
-             "Be helpful, concise, and conversational.\n\n{history_str}"),
+            ("system", f"You are a friendly AI assistant. Today's date is {current_date}. "
+                       f"Be helpful and concise.\n\n{{history_str}}"),
             ("human", "{input}"),
         ])
         answer = (prompt | llm).invoke({"input": query, "history_str": history_str}).content
-        return {"answer": answer, "source_type": "llm_knowledge"}
-        
-    # Format the combined context and truncate to protect LLM token limits
+        return {
+            "answer": answer,
+            "needs_web_search": False,
+            "source_type": "llm_knowledge",
+            "timings": {**state.get("timings", {}), "generate_answer": round(time.time() - t, 2)},
+        }
+
+    # ── Build context from retrieved documents ────────────────────────────────
     context = "\n\n".join([doc.page_content for doc in docs])
-    if len(context) > 12000:
-        context = context[:12000] + "\n...[Context truncated due to length]..."
-    
-    history_str = "Chat History:\n" + "\n".join([f"{msg['role'].capitalize()}: {msg['content']}" for msg in chat_history[-10:]]) + "\n\n" if chat_history else ""
-    
-    system_prompt = (
-        "You are an expert assistant. The context below was extracted directly from the user's own "
-        "uploaded documents (PDFs, text files, code, web pages, etc.). When the user refers to "
-        "'my resume', 'the document', 'the file', or 'my data', they are referring to THIS context — "
-        "it IS their document content.\n\n"
-        "Use this context as the primary source for your answer. You may supplement with your own "
-        "general knowledge only when the context is insufficient.\n\n"
-        "{history_str}"
-        "Context from user's documents:\n{context}"
-    )
-    
+    if len(context) > config.CONTEXT_MAX_CHARS:
+        context = context[:config.CONTEXT_MAX_CHARS] + "\n...[Context truncated due to length]..."
+
+    if state.get("source_type") in {"web", "hybrid_web"}:
+        system_prompt = (
+            "You are an expert assistant. The context below contains web search results. "
+            "Use it to answer the user's current or time-sensitive question. "
+            "If the search results do not contain an exact value, say that clearly "
+            "and summarise the most useful available result.\n\n"
+            "{history_str}"
+            "Web context:\n{context}"
+        )
+    else:
+        system_prompt = (
+            "You are an expert assistant. The context below was extracted from the user's documents. "
+            "Use this context as the primary source for your answer.\n\n"
+            "CRITICAL: If the context DOES NOT contain the answer, "
+            "output exactly: 'INSUFFICIENT_CONTEXT'\n\n"
+            "{history_str}"
+            "Context:\n{context}"
+        )
+
     prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
         ("human", "{input}"),
     ])
-    
-    t = time.time()
-    answer = (prompt | llm).invoke({"input": query, "history_str": history_str, "context": context}).content
-    print(f"[Answer] Generated final answer in {time.time() - t:.1f}s")
-    
-    return {"answer": answer}
+
+    answer = (prompt | llm).invoke({
+        "input": query,
+        "history_str": history_str,
+        "context": context,
+    }).content
+
+    # ── Insufficient context guard → trigger web search fallback ──────────────
+    if "INSUFFICIENT_CONTEXT" in answer and state.get("source_type") not in {"web", "hybrid_web"}:
+        logger.info("[Answer] Context insufficient. Triggering web search fallback.")
+        return {
+            "needs_web_search": True,
+            "answer": "",
+            "timings": {**state.get("timings", {}), "generate_answer": round(time.time() - t, 2)},
+        }
+
+    logger.info("[Answer] Generated in %.1fs", time.time() - t)
+    return {
+        "answer": answer,
+        "needs_web_search": False,
+        "timings": {**state.get("timings", {}), "generate_answer": round(time.time() - t, 2)},
+    }
 
 
-# ──────────────────────────────────────────────
-# Conditional Edge Router
-# ──────────────────────────────────────────────
-def route_after_reflection(state: AgentState):
-    """Route to web search or directly to evidence fusion."""
-    if state.get("needs_web_search", False):
+def route_after_answer(state: AgentState):
+    """Conditional edge: route to web_search ONLY if context was insufficient AND web not yet tried."""
+    if state.get("needs_web_search") and not state.get("web_search_attempted", False):
         return "web_search"
-    return "evidence_fusion"
+    return END
 
 
-# ══════════════════════════════════════════════
-# Build the Graph
-# ══════════════════════════════════════════════
-#
-# Flow:
-#   START → planner → query_expansion → metadata_filter → retriever
-#         → reflection → [web_search?] → evidence_fusion → reranker → answer → END
-#
-workflow = StateGraph(AgentState)
+# ──────────────────────────────────────────────
+# Graph Compilation
+# ──────────────────────────────────────────────
 
-workflow.add_node("router", router_node)
-workflow.add_node("planner", planner_node)
-workflow.add_node("query_expansion", query_expansion_node)
-workflow.add_node("metadata_filter", metadata_filter_node)
-workflow.add_node("retriever", retriever_node)
-workflow.add_node("reflection", reflection_node)
-workflow.add_node("web_search", web_search_node)
-workflow.add_node("evidence_fusion", evidence_fusion_node)
-workflow.add_node("reranker", reranker_node)
-workflow.add_node("generate_answer", answer_node)
+@functools.lru_cache(maxsize=1)
+def compile_graph():
+    """Build and compile the LangGraph StateGraph.
 
-# Linear edges
-workflow.add_edge(START, "router")
-workflow.add_conditional_edges(
-    "router",
-    route_after_router,
-    {"planner": "planner", "generate_answer": "generate_answer"}
-)
-workflow.add_edge("planner", "query_expansion")
-workflow.add_edge("query_expansion", "metadata_filter")
-workflow.add_edge("metadata_filter", "retriever")
-workflow.add_edge("retriever", "reflection")
+    Cached with lru_cache so the (slightly expensive) compilation happens once
+    per process lifetime, not once per query.
 
-# Conditional: reflection decides if web search is needed
-workflow.add_conditional_edges(
-    "reflection",
-    route_after_reflection,
-    {"web_search": "web_search", "evidence_fusion": "evidence_fusion"}
-)
+    Graph topology:
+        START → router
+        router  →(conditional)→ retriever | web_search | generate_answer
+        retriever → generate_answer
+        web_search → generate_answer
+        generate_answer →(conditional)→ web_search (fallback) | END
 
-# Both paths converge at evidence_fusion
-workflow.add_edge("web_search", "evidence_fusion")
-workflow.add_edge("evidence_fusion", "reranker")
-workflow.add_edge("reranker", "generate_answer")
-workflow.add_edge("generate_answer", END)
+    The cycle (generate_answer → web_search → generate_answer) is intentional:
+    if local documents don't contain the answer, the graph autonomously retries
+    with live web search results. The web_search_attempted flag in AgentState
+    prevents infinite loops.
+    """
+    builder = StateGraph(AgentState)
 
-# Compile with MemorySaver to enable Persistence
-memory = MemorySaver()
-app = workflow.compile(checkpointer=memory)
+    # Register nodes
+    builder.add_node("router",          router_node)
+    builder.add_node("retriever",       retriever_node)
+    builder.add_node("web_search",      web_search_node)
+    builder.add_node("generate_answer", answer_node)
+
+    # Entry edge
+    builder.add_edge(START, "router")
+
+    # Routing: after router, choose retriever / web_search / generate_answer
+    builder.add_conditional_edges("router", route_after_router)
+
+    # Retrieval and web search always flow into answer generation
+    builder.add_edge("retriever",  "generate_answer")
+    builder.add_edge("web_search", "generate_answer")
+
+    # After answer: either done or web-search fallback (handles the cycle)
+    builder.add_conditional_edges("generate_answer", route_after_answer)
+
+    return builder.compile()

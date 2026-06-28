@@ -1,80 +1,123 @@
 import time
+from typing import List, Literal
+from pydantic import BaseModel, Field
 from langchain_core.prompts import ChatPromptTemplate
+from backend.logger import get_logger
+
+logger = get_logger(__name__)
+
+
+# ── Structured Output Schema ───────────────────────────────────────────────────
+
+class RouterDecision(BaseModel):
+    """Structured routing decision produced by the LLM.
+
+    Using Pydantic + LLM structured output instead of regex string-matching
+    eliminates an entire class of parsing bugs and makes the router's output
+    directly inspectable and type-safe.
+    """
+    strategy: Literal["llm_knowledge", "web_search", "targeted_search", "all_docs"] = Field(
+        description=(
+            "llm_knowledge — greetings or general knowledge with no document relevance. "
+            "web_search — live/current/today/price/weather/news questions. "
+            "targeted_search — query clearly about a specific named document. "
+            "all_docs — broad questions about uploaded documents or when unsure."
+        )
+    )
+    sources: List[str] = Field(
+        default_factory=list,
+        description="For targeted_search only: exact filenames from the available sources list.",
+    )
+    reasoning: str = Field(
+        default="",
+        description="One-sentence justification for the routing decision (used for logging).",
+    )
+
+
+# ── Router Function ────────────────────────────────────────────────────────────
 
 def route_query(query: str, llm, indexed_sources: list) -> dict:
     """Use the LLM to classify the query into a retrieval strategy.
-    
+
     Returns:
         dict with keys:
-            - strategy: 'llm_knowledge' | 'targeted_search' | 'all_docs'
+            - strategy: 'llm_knowledge' | 'web_search' | 'targeted_search' | 'all_docs'
             - sources:  list of source names (only for targeted_search)
     """
-    sources_list = "\n".join(f"- {s}" for s in indexed_sources) if indexed_sources else "- (none)"
+    sources_list = (
+        "\n".join(f"- {s}" for s in indexed_sources)
+        if indexed_sources else "- (no documents indexed)"
+    )
 
-    # Hardcoded bypass for common LLM hallucinations
+    # ── Fast-path: hardcoded bypass for unambiguous document-action queries ────
     query_lower = query.lower()
     if any(action in query_lower for action in ["analyse", "analyze", "summarize", "read"]) and \
        any(target in query_lower for target in ["resume", "document", "file", "uploaded"]):
-        print(f"[Router] Query: '{query}' -> Hardcoded Decision: ALL_DOCS")
+        logger.info("[Router] Query: '%s' -> Hardcoded bypass: ALL_DOCS", query)
         return {"strategy": "all_docs", "sources": []}
 
+    # ── LLM-based structured routing ──────────────────────────────────────────
     router_prompt = ChatPromptTemplate.from_messages([
         ("system",
-         "You are a query router for a RAG system. Classify the user's query "
-         "into exactly ONE retrieval strategy.\n\n"
+         "You are a query router for a RAG (Retrieval-Augmented Generation) system.\n\n"
          "Available indexed documents:\n"
          f"{sources_list}\n\n"
-         "Strategies:\n"
-         "1. LLM_KNOWLEDGE — For greetings, casual chat, or general knowledge questions "
-         "that have NOTHING to do with any documents.\n"
-         "2. TARGETED_SEARCH:<source1> — When the query clearly relates to a specific document "
-         "from the list above. Include the EXACT source name after the colon.\n"
-         "3. ALL_DOCS — When the query asks about 'my documents', 'the resume', 'the uploaded file', "
-         "or any broad research question where you are unsure which specific document is relevant.\n\n"
-         "CRITICAL: If the user asks you to analyze, read, or summarize 'the document', 'the resume', "
-         "or 'the file', you MUST output ALL_DOCS or TARGETED_SEARCH. NEVER use LLM_KNOWLEDGE for these.\n\n"
-         "Reply with ONLY the strategy label, nothing else.\n\n"
-         "Examples:\n"
-         "- 'hey how are you' → LLM_KNOWLEDGE\n"
-         "- 'what is machine learning' → LLM_KNOWLEDGE\n"
-         "- 'summarize report.pdf' → TARGETED_SEARCH:report.pdf\n"
-         "- 'what does main.py do' → TARGETED_SEARCH:main.py\n"
-         "- 'compare findings across all papers' → ALL_DOCS\n"
-         "- 'what do my documents say about AI' → ALL_DOCS"),
-        ("human", "{query}")
+         "Routing strategies:\n"
+         "1. llm_knowledge — Use for greetings, casual chat, or general knowledge "
+         "questions that have NOTHING to do with any documents.\n"
+         "2. web_search — Use for current/live/today/latest/price/rate/weather/news "
+         "questions that require up-to-date information.\n"
+         "3. targeted_search — Use when the query CLEARLY references a specific named "
+         "document from the available list above. Put the exact filename(s) in 'sources'.\n"
+         "4. all_docs — Use for broad questions about 'my documents', 'the uploaded file', "
+         "'the resume', or any research question spanning all documents.\n\n"
+         "CRITICAL RULES:\n"
+         "- If the user asks to analyze/read/summarize 'the document' or 'my file', "
+         "choose all_docs or targeted_search. NEVER llm_knowledge.\n"
+         "- If the query contains 'today', 'current', 'live', 'price', 'rate', or 'news', "
+         "choose web_search. NEVER llm_knowledge.\n"
+         "- If no documents are indexed, prefer llm_knowledge for document-type queries."),
+        ("human", "{query}"),
     ])
 
-    router_chain = router_prompt | llm
+    structured_llm = llm.with_structured_output(RouterDecision)
+    router_chain = router_prompt | structured_llm
+
     t = time.time()
-    response = router_chain.invoke({"query": query}).content.strip()
-    print(f"[Router] Query: '{query}' -> Decision: {response} ({time.time() - t:.1f}s)")
+    try:
+        raw = router_chain.invoke({"query": query})
+        # with_structured_output returns a Pydantic model on newer langchain-groq
+        # and a plain dict on older versions (e.g. 0.1.5). Handle both.
+        if isinstance(raw, dict):
+            decision = RouterDecision(**raw)
+        else:
+            decision = raw
+    except Exception as exc:
+        logger.warning(
+            "[Router] Structured output failed: %s. Defaulting to all_docs.", exc
+        )
+        return {"strategy": "all_docs", "sources": []}
 
-    response_clean = response.strip().upper()
+    logger.info(
+        "[Router] Query: '%s' -> Strategy: %s | Sources: %s | Reason: '%s' (%.1fs)",
+        query, decision.strategy, decision.sources, decision.reasoning, time.time() - t,
+    )
 
-    # Parse the router response
-    if "TARGETED_SEARCH:" in response_clean:
-        # Extract the part after TARGETED_SEARCH:
-        idx = response.upper().find("TARGETED_SEARCH:")
-        sources_str_original = response[idx + len("TARGETED_SEARCH:"):].strip()
-        
-        target_sources = [s.strip() for s in sources_str_original.split(",") if s.strip()]
-        
-        # Case-insensitive validation
-        valid_sources = []
+    # ── Validate targeted sources against what is actually indexed ─────────────
+    if decision.strategy == "targeted_search":
         indexed_lower = {s.lower(): s for s in indexed_sources}
-        for ts in target_sources:
-            if ts.lower() in indexed_lower:
-                valid_sources.append(indexed_lower[ts.lower()])
-                
+        valid_sources = [
+            indexed_lower[s.lower()]
+            for s in decision.sources
+            if s.lower() in indexed_lower
+        ]
         if valid_sources:
             return {"strategy": "targeted_search", "sources": valid_sources}
         else:
-            print(f"[Router] Sources {target_sources} not found in index, falling back to ALL_DOCS")
+            logger.warning(
+                "[Router] Sources %s not found in index. Falling back to all_docs.",
+                decision.sources,
+            )
             return {"strategy": "all_docs", "sources": []}
-            
-    elif "ALL_DOCS" in response_clean:
-        return {"strategy": "all_docs", "sources": []}
-        
-    else:
-        # Defaults to llm_knowledge for any other response
-        return {"strategy": "llm_knowledge", "sources": []}
+
+    return {"strategy": decision.strategy, "sources": decision.sources}

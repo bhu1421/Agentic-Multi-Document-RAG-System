@@ -1,0 +1,22 @@
+
+services:
+  rag-app:
+    build: .
+    container_name: agentic_rag_app
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    environment:
+      - STREAMLIT_SERVER_ENABLE_FILE_WATCHER=false
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - qdrant_data:/app/local_qdrant
+      - uploaded_docs:/app/uploaded_docs
+      - cloned_repos:/app/cloned_repos
+
+volumes:
+  qdrant_data:
+  uploaded_docs:
+  cloned_repos:

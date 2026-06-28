@@ -1,64 +1,68 @@
 import time
-import streamlit as st
+import os
+import functools
 from langchain_core.documents import Document
-from langchain_community.retrievers import BM25Retriever
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 from qdrant_client.http import models
+from backend import config
+from backend.logger import get_logger
 
-# Module-level caches
-_reranker_model = None
-_bm25_docs_cache = None        # cached list of Document objects
-_bm25_docs_hash = None         # track when docs change (count-based)
+logger = get_logger(__name__)
 
-@st.cache_resource(show_spinner=False)
+
+def _get_device() -> str:
+    """Auto-detect the best available hardware accelerator."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+    except ImportError:
+        pass
+    return "cpu"
+
+
+def should_use_reranker() -> bool:
+    """Determine whether to run the cross-encoder reranker.
+
+    Priority order:
+    1. ENABLE_RERANKER env var explicitly set to true/1/yes  → always rerank
+    2. ENABLE_RERANKER env var explicitly set to false/0/no  → never rerank
+    3. No env var set → rerank only when a GPU/MPS is available (CPU is too slow)
+
+    The sidebar toggle sets os.environ["ENABLE_RERANKER"] at runtime, so
+    users can toggle reranking on/off without restarting the app.
+    """
+    val = os.getenv("ENABLE_RERANKER", "").lower()
+    if val in {"1", "true", "yes"}:
+        return True
+    if val in {"0", "false", "no"}:
+        return False
+    # Default: only rerank when hardware acceleration is available
+    return _get_device() != "cpu"
+
+
+@functools.lru_cache(maxsize=1)
 def get_reranker():
-    """Load the cross-encoder reranker model once and reuse it."""
-    print("[Cache] Loading BAAI/bge-reranker-large (one-time)...")
+    """Load the cross-encoder reranker model once and reuse it.
+
+    Design decision: two-stage retrieval
+    Stage 1 (bi-encoder / MiniLM) — fast approximate nearest-neighbour search.
+             Retrieves config.TOP_K candidates in milliseconds.
+    Stage 2 (cross-encoder / BGE) — precise relevance scoring.
+             Scores (query, document) pairs together; much more accurate but
+             O(n) with document count — only applied to the top candidates.
+    """
+    device = _get_device()
+    logger.info("[Device] %s running on: %s", config.RERANKER_MODEL, device.upper())
     t = time.time()
     model = HuggingFaceCrossEncoder(
-        model_name="BAAI/bge-reranker-large",
-        model_kwargs={'device': 'cpu'}  # Force CPU to prevent meta tensor bugs
+        model_name=config.RERANKER_MODEL,
+        model_kwargs={"device": device},
     )
-    print(f"[Cache] Reranker loaded in {time.time() - t:.1f}s")
+    logger.info("[Cache] Reranker loaded in %.1fs", time.time() - t)
     return model
-
-def get_cached_docs(store):
-    """Cache the BM25 document list. Only re-fetch if collection size changes."""
-    global _bm25_docs_cache, _bm25_docs_hash
-    
-    try:
-        # Quick count check — avoids full scroll if nothing changed
-        collection_info = store.client.get_collection("rag_collection")
-        current_count = collection_info.points_count
-    except Exception:
-        current_count = -1
-    
-    if _bm25_docs_cache is not None and _bm25_docs_hash == current_count:
-        print(f"[Cache] BM25 docs cache hit ({current_count} docs)")
-        return _bm25_docs_cache
-    
-    # Cache miss — rebuild
-    print(f"[Cache] Rebuilding BM25 docs cache ({current_count} docs)...")
-    try:
-        records, _ = store.client.scroll(
-            collection_name="rag_collection",
-            limit=10000,
-            with_payload=True,
-            with_vectors=False
-        )
-        _bm25_docs_cache = [
-            Document(
-                page_content=r.payload.get("page_content", ""),
-                metadata=r.payload.get("metadata", {})
-            )
-            for r in records
-        ]
-        _bm25_docs_hash = current_count
-    except Exception:
-        _bm25_docs_cache = []
-        _bm25_docs_hash = None
-    
-    return _bm25_docs_cache
 
 
 def _build_qdrant_filter(target_sources=None, metadata_filters=None):
@@ -70,28 +74,23 @@ def _build_qdrant_filter(target_sources=None, metadata_filters=None):
     """
     must_conditions = []
 
-    # Source filter (OR: match any of these sources)
     if target_sources:
         source_filter = models.Filter(
             should=[
-                models.FieldCondition(
-                    key="metadata.source",
-                    match=models.MatchValue(value=src)
-                )
+                models.FieldCondition(key="metadata.source", match=models.MatchValue(value=src))
                 for src in target_sources
             ]
         )
         must_conditions.append(source_filter)
 
-    # Metadata filters (AND: all must match)
     if metadata_filters:
         for key, value in metadata_filters.items():
             if key == "source" or value is None:
-                continue  # source is handled above
+                continue
             must_conditions.append(
                 models.FieldCondition(
                     key=f"metadata.{key}",
-                    match=models.MatchValue(value=value)
+                    match=models.MatchValue(value=value),
                 )
             )
 
@@ -100,105 +99,106 @@ def _build_qdrant_filter(target_sources=None, metadata_filters=None):
     return None
 
 
-class CustomHybridRetriever:
-    """Custom Reciprocal Rank Fusion (Ensemble) retriever.
+def build_retrieval_pipeline(store, target_sources=None, metadata_filters=None):
+    """Build the Qdrant MMR retrieval pipeline.
 
-    Combines dense (Qdrant MMR) and sparse (BM25) results via RRF.
-    Reranking is now handled by a separate graph node, so this class
-    only performs retrieval and fusion.
+    MMR (Maximal Marginal Relevance) balances relevance with diversity:
+    it penalises chunks that are too similar to already-selected chunks,
+    reducing redundancy in the context window.
+
+    config.TOP_K  — how many final candidates to return
+    config.FETCH_K — how many candidates MMR considers before pruning to TOP_K
     """
-    def __init__(self, qdrant_retriever, bm25_retriever, top_k=15):
-        self.qdrant_retriever = qdrant_retriever
-        self.bm25_retriever = bm25_retriever
-        self.top_k = top_k
+    search_kwargs = {"k": config.TOP_K, "fetch_k": config.FETCH_K}
 
-    def _rrf(self, doc_lists, k=60):
-        """Reciprocal Rank Fusion."""
-        rrf_score = {}
-        for doc_list in doc_lists:
-            for rank, doc in enumerate(doc_list):
-                # Use page_content as unique identifier for RRF
-                content = doc.page_content
-                if content not in rrf_score:
-                    rrf_score[content] = {"doc": doc, "score": 0.0}
-                rrf_score[content]["score"] += 1.0 / (rank + k)
-        
-        ranked_docs = sorted(rrf_score.values(), key=lambda x: x["score"], reverse=True)
-        return [item["doc"] for item in ranked_docs]
-
-    def invoke(self, query: str):
-        # 1. Fetch from Dense (Qdrant)
-        qdrant_docs = self.qdrant_retriever.invoke(query)
-        
-        # 2. Fetch from Sparse (BM25) if available
-        bm25_docs = []
-        if self.bm25_retriever:
-            bm25_docs = self.bm25_retriever.invoke(query)
-            
-        # 3. Combine via RRF
-        if bm25_docs:
-            fused_docs = self._rrf([qdrant_docs, bm25_docs])
-        else:
-            fused_docs = qdrant_docs
-
-        # Return top_k — reranking is handled downstream by the Reranker node
-        return fused_docs[:self.top_k]
-
-
-def build_retrieval_pipeline(store, llm, all_docs, target_sources=None, metadata_filters=None):
-    """Build the full retrieval pipeline (BM25 + Qdrant → RRF).
-
-    Reranking has been extracted to a standalone graph node so it can
-    operate on the full fused evidence (local + web + metadata-filtered).
-
-    Args:
-        store: Qdrant vector store instance.
-        llm: Language model (unused here, kept for API compatibility).
-        all_docs: Full list of cached documents for BM25.
-        target_sources: List of source filenames to restrict search to.
-        metadata_filters: Dict of metadata field conditions (file_type, page, section).
-    """
-    # --- Dense Retriever (Qdrant MMR) ---
-    search_kwargs = {"k": 30, "fetch_k": 60}
-
-    # Build combined Qdrant filter from sources + metadata
     qdrant_filter = _build_qdrant_filter(target_sources, metadata_filters)
     if qdrant_filter:
         search_kwargs["filter"] = qdrant_filter
-        print(f"[Retriever] Qdrant filter applied: sources={target_sources}, metadata={metadata_filters}")
+        logger.info(
+            "[Retriever] Qdrant filter: sources=%s metadata=%s",
+            target_sources, metadata_filters,
+        )
 
-    qdrant_retriever = store.as_retriever(
-        search_type="mmr",
-        search_kwargs=search_kwargs
-    )
+    return store.as_retriever(search_type="mmr", search_kwargs=search_kwargs)
 
-    # --- Sparse Retriever (BM25) ---
-    bm25_retriever = None
-    try:
-        # Filter BM25 docs by source
-        if target_sources:
-            filtered_docs = [d for d in all_docs if d.metadata.get("source") in target_sources]
-        else:
-            filtered_docs = all_docs
 
-        # Also apply metadata filters to BM25 docs (string comparison for type safety)
-        if metadata_filters:
-            for key, value in metadata_filters.items():
-                if key != "source" and value is not None:
-                    filtered_docs = [
-                        d for d in filtered_docs
-                        if str(d.metadata.get(key, "")) == str(value)
+def expand_to_parent_context(matched_docs, store, top_n_parents=config.MAX_PARENTS, user_id: str | None = None):
+    """Hierarchical retrieval: given exact chunk matches, fetch all sibling chunks.
+
+    Problem solved: a matched chunk might say "He signed the contract on page 4."
+    Without context, "He" is ambiguous. By fetching all chunks sharing the same
+    parent_id, we reconstruct the full document section and give the LLM
+    complete, coherent context.
+
+    Implementation: every chunk stores a parent_id set at indexing time
+    (see chunker.py). We use Qdrant's scroll API to fetch all chunks with
+    matching parent_id, then sort them by page/chunk_id to restore reading order.
+    """
+    if not store or not matched_docs:
+        return matched_docs
+
+    parent_ids = []
+    seen_parents = set()
+    for d in matched_docs:
+        pid = d.metadata.get("parent_id")
+        if pid and pid not in seen_parents:
+            seen_parents.add(pid)
+            parent_ids.append(pid)
+            if len(parent_ids) >= top_n_parents:
+                break
+
+    if not parent_ids:
+        return matched_docs
+
+    logger.info("[HierarchicalRetrieval] Expanding context for %d parent documents", len(parent_ids))
+
+    expanded_docs = []
+    seen_chunks = set()
+    client = store.client
+    collection_name = store.collection_name
+
+    for pid in parent_ids:
+        try:
+            records, _ = client.scroll(
+                collection_name=collection_name,
+                scroll_filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="metadata.parent_id",
+                            match=models.MatchValue(value=pid),
+                        )
                     ]
+                ),
+                limit=100,
+                with_payload=True,
+                with_vectors=False,
+            )
 
-        if filtered_docs:
-            bm25_retriever = BM25Retriever.from_documents(filtered_docs)
-            bm25_retriever.k = 30
-    except Exception as e:
-        print(f"[BM25] Initialization failed, falling back to Qdrant only: {e}")
+            siblings = [
+                Document(
+                    page_content=r.payload.get("page_content", ""),
+                    metadata=r.payload.get("metadata", {}),
+                )
+                for r in records
+            ]
 
-    # Return pipeline — reranking happens in the standalone Reranker node
-    return CustomHybridRetriever(
-        qdrant_retriever=qdrant_retriever,
-        bm25_retriever=bm25_retriever,
-        top_k=15  # Return more candidates; Reranker will narrow to top 8
+            # Restore reading order within the parent document
+            siblings.sort(key=lambda d: (d.metadata.get("page", 0), d.metadata.get("chunk_id", "")))
+
+            for doc in siblings:
+                chunk_id = doc.metadata.get("chunk_id")
+                if chunk_id is None or chunk_id not in seen_chunks:
+                    if chunk_id is not None:
+                        seen_chunks.add(chunk_id)
+                    expanded_docs.append(doc)
+
+        except Exception as exc:
+            logger.warning("[HierarchicalRetrieval] Failed to expand parent_id %s: %s", pid, exc)
+
+    logger.info(
+        "[HierarchicalRetrieval] Expanded %d initial chunks → %d full-document chunks",
+        len(matched_docs), len(expanded_docs),
     )
+
+    # Cap to prevent blowing up the reranker / context window
+    return expanded_docs[:config.MAX_EXPANDED_CHUNKS]

@@ -1,0 +1,122 @@
+[
+  {
+    "id": 1,
+    "question": "Hello, how are you?",
+    "expected_strategy": "llm_knowledge",
+    "category": "greeting"
+  },
+  {
+    "id": 2,
+    "question": "What is machine learning?",
+    "expected_strategy": "llm_knowledge",
+    "category": "general_knowledge"
+  },
+  {
+    "id": 3,
+    "question": "Explain the difference between supervised and unsupervised learning",
+    "expected_strategy": "llm_knowledge",
+    "category": "general_knowledge"
+  },
+  {
+    "id": 4,
+    "question": "What is 2 + 2?",
+    "expected_strategy": "llm_knowledge",
+    "category": "trivial"
+  },
+  {
+    "id": 5,
+    "question": "Tell me a joke",
+    "expected_strategy": "llm_knowledge",
+    "category": "casual"
+  },
+  {
+    "id": 6,
+    "question": "What is the gold price today?",
+    "expected_strategy": "web_search",
+    "category": "live_data"
+  },
+  {
+    "id": 7,
+    "question": "What is the weather in Mumbai right now?",
+    "expected_strategy": "web_search",
+    "category": "live_data"
+  },
+  {
+    "id": 8,
+    "question": "What is the latest news in AI?",
+    "expected_strategy": "web_search",
+    "category": "current_events"
+  },
+  {
+    "id": 9,
+    "question": "What is the current USD to INR exchange rate?",
+    "expected_strategy": "web_search",
+    "category": "live_data"
+  },
+  {
+    "id": 10,
+    "question": "Who won the cricket match last night?",
+    "expected_strategy": "web_search",
+    "category": "current_events"
+  },
+  {
+    "id": 11,
+    "question": "What do my uploaded documents say about AI?",
+    "expected_strategy": "all_docs",
+    "category": "broad_document"
+  },
+  {
+    "id": 12,
+    "question": "Summarize all the documents I have uploaded",
+    "expected_strategy": "all_docs",
+    "category": "broad_document"
+  },
+  {
+    "id": 13,
+    "question": "What are the key findings across all my research papers?",
+    "expected_strategy": "all_docs",
+    "category": "broad_document"
+  },
+  {
+    "id": 14,
+    "question": "Compare the topics covered across all my documents",
+    "expected_strategy": "all_docs",
+    "category": "broad_document"
+  },
+  {
+    "id": 15,
+    "question": "Analyze my resume",
+    "expected_strategy": "all_docs",
+    "category": "document_action"
+  },
+  {
+    "id": 16,
+    "question": "What is quantum computing?",
+    "expected_strategy": "llm_knowledge",
+    "category": "general_knowledge"
+  },
+  {
+    "id": 17,
+    "question": "What is the Sensex trading at today?",
+    "expected_strategy": "web_search",
+    "category": "live_data"
+  },
+  {
+    "id": 18,
+    "question": "Summarize the uploaded file",
+    "expected_strategy": "all_docs",
+    "category": "document_action"
+  },
+  {
+    "id": 19,
+    "question": "What programming languages are mentioned in the uploaded document?",
+    "expected_strategy": "all_docs",
+    "category": "document_query"
+  },
+  {
+    "id": 20,
+    "question": "What is the capital of France?",
+    "expected_strategy": "llm_knowledge",
+    "category": "general_knowledge"
+  }
+]
