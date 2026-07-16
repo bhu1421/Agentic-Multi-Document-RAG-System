@@ -50,3 +50,6 @@ pydantic==2.7.1
 
 # ── Utilities ─────────────────────────────────────────────────────
 python-dotenv==1.0.1
+
+# ── Caching (optional — system works without Redis) ───────────────────────
+redis==5.0.4

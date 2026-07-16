@@ -14,13 +14,37 @@ from backend.retrieval import (
     get_reranker,
     should_use_reranker,
 )
+from backend.guardrail import guardrail_node
+from backend.rewrite import (
+    evaluate_retrieval_node,
+    rewrite_query_node,
+    route_after_evaluation,
+)
+from backend.cache import (
+    cache_check_node,
+    cache_store_node,
+    route_after_cache,
+)
 from backend.logger import get_logger
 
 logger = get_logger(__name__)
 
 
 # ──────────────────────────────────────────────
-# Node 1 — Router
+# Node — Guardrail (imported from guardrail.py)
+# ──────────────────────────────────────────────
+# guardrail_node is imported above
+
+
+def route_after_guardrail(state: AgentState):
+    """Conditional edge: proceed to router only if guardrail passed."""
+    if state.get("guardrail_result") == "blocked":
+        return "__end__"
+    return "router"
+
+
+# ──────────────────────────────────────────────
+# Node — Router
 # ──────────────────────────────────────────────
 def router_node(state: AgentState):
     """Classify the query to determine the best retrieval strategy.
@@ -58,7 +82,7 @@ def route_after_router(state: AgentState):
 
 
 # ──────────────────────────────────────────────
-# Node 2 — Retriever (MMR + Hierarchical + Rerank)
+# Node — Retriever (MMR + Hierarchical + Rerank)
 # ──────────────────────────────────────────────
 def retriever_node(state: AgentState):
     """Execute dense retrieval, hierarchical parent expansion, and optional reranking.
@@ -124,7 +148,7 @@ def retriever_node(state: AgentState):
 
 
 # ──────────────────────────────────────────────
-# Node 3 — Web Search (Fallback)
+# Node — Web Search (Fallback)
 # ──────────────────────────────────────────────
 def web_search_node(state: AgentState):
     """Use Tavily to search the web for external or time-sensitive knowledge."""
@@ -161,7 +185,7 @@ def web_search_node(state: AgentState):
 
 
 # ──────────────────────────────────────────────
-# Node 4 — Generate Answer
+# Node — Generate Answer
 # ──────────────────────────────────────────────
 def answer_node(state: AgentState):
     """Generate the final answer based on retrieved evidence.
@@ -258,51 +282,69 @@ def route_after_answer(state: AgentState):
     """Conditional edge: route to web_search ONLY if context was insufficient AND web not yet tried."""
     if state.get("needs_web_search") and not state.get("web_search_attempted", False):
         return "web_search"
-    return END
+    return "cache_store"
 
 
 # ──────────────────────────────────────────────
 # Graph Compilation
 # ──────────────────────────────────────────────
 
-@functools.lru_cache(maxsize=1)
 def compile_graph():
     """Build and compile the LangGraph StateGraph.
 
-    Cached with lru_cache so the (slightly expensive) compilation happens once
-    per process lifetime, not once per query.
-
     Graph topology:
-        START → router
+        START → cache_check
+        cache_check →(conditional)→ END (hit) | guardrail (miss)
+        guardrail →(conditional)→ END (blocked) | router (pass)
         router  →(conditional)→ retriever | web_search | generate_answer
-        retriever → generate_answer
+        retriever → evaluate_retrieval
+        evaluate_retrieval →(conditional)→ generate_answer | rewrite_query
+        rewrite_query → retriever
         web_search → generate_answer
-        generate_answer →(conditional)→ web_search (fallback) | END
-
-    The cycle (generate_answer → web_search → generate_answer) is intentional:
-    if local documents don't contain the answer, the graph autonomously retries
-    with live web search results. The web_search_attempted flag in AgentState
-    prevents infinite loops.
+        generate_answer →(conditional)→ web_search (fallback) | cache_store
+        cache_store → END
     """
     builder = StateGraph(AgentState)
 
     # Register nodes
-    builder.add_node("router",          router_node)
-    builder.add_node("retriever",       retriever_node)
-    builder.add_node("web_search",      web_search_node)
-    builder.add_node("generate_answer", answer_node)
+    builder.add_node("cache_check",        cache_check_node)
+    builder.add_node("guardrail",          guardrail_node)
+    builder.add_node("router",             router_node)
+    builder.add_node("retriever",          retriever_node)
+    builder.add_node("evaluate_retrieval", evaluate_retrieval_node)
+    builder.add_node("rewrite_query",      rewrite_query_node)
+    builder.add_node("web_search",         web_search_node)
+    builder.add_node("generate_answer",    answer_node)
+    builder.add_node("cache_store",        cache_store_node)
 
     # Entry edge
-    builder.add_edge(START, "router")
+    builder.add_edge(START, "cache_check")
+
+    # Cache check: hit → END, miss → guardrail
+    builder.add_conditional_edges("cache_check", route_after_cache)
+
+    # Guardrail: blocked → END, pass → router
+    builder.add_conditional_edges("guardrail", route_after_guardrail)
 
     # Routing: after router, choose retriever / web_search / generate_answer
     builder.add_conditional_edges("router", route_after_router)
 
-    # Retrieval and web search always flow into answer generation
-    builder.add_edge("retriever",  "generate_answer")
+    # Retrieval flows into evaluation
+    builder.add_edge("retriever", "evaluate_retrieval")
+
+    # Evaluation: confident → generate_answer, low → rewrite_query
+    builder.add_conditional_edges("evaluate_retrieval", route_after_evaluation)
+
+    # Rewrite always retries the retriever
+    builder.add_edge("rewrite_query", "retriever")
+
+    # Web search flows into answer generation
     builder.add_edge("web_search", "generate_answer")
 
-    # After answer: either done or web-search fallback (handles the cycle)
+    # After answer: either web-search fallback or cache store
     builder.add_conditional_edges("generate_answer", route_after_answer)
+
+    # Cache store flows to END
+    builder.add_edge("cache_store", END)
 
     return builder.compile()

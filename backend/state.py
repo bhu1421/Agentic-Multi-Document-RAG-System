@@ -14,15 +14,28 @@ class AgentState(TypedDict):
     chat_history: list
     user_id: str
 
+    # ── Guardrail ─────────────────────────────────────────────────────────────
+    guardrail_result: str          # "pass" | "blocked"
+    guardrail_reason: str          # reason for blocking (empty if passed)
+
     # ── Retrieval ─────────────────────────────────────────────────────────────
     retrieved_docs: List[Document]
     target_sources: List[str]
+
+    # ── Query Rewriting ───────────────────────────────────────────────────────
+    original_query: str            # preserved original user query
+    rewritten_query: str           # LLM-rewritten query (empty if not rewritten)
+    retrieval_attempts: int        # counter: 0 = first attempt, 1 = retry
+    retrieval_confidence: float    # confidence score from retrieval evaluation
 
     # ── Routing / Control ─────────────────────────────────────────────────────
     strategy: str
     source_type: str
     needs_web_search: bool
-    web_search_attempted: bool   # Guard against infinite web-search loop
+    web_search_attempted: bool     # Guard against infinite web-search loop
+
+    # ── Cache ─────────────────────────────────────────────────────────────────
+    cache_hit: bool                # whether answer was served from cache
 
     # ── Output ────────────────────────────────────────────────────────────────
     answer: str

@@ -7,10 +7,15 @@ logger = get_logger(__name__)
 
 # Human-readable labels for each LangGraph node shown in the streaming UI
 NODE_LABELS: dict[str, str] = {
-    "router":          "🔀 Routing query...",
-    "retriever":       "📂 Retrieving documents...",
-    "web_search":      "🌐 Searching the web...",
-    "generate_answer": "✍️  Generating answer...",
+    "cache_check":        "⚡ Checking cache...",
+    "guardrail":          "🛡️ Checking guardrails...",
+    "router":             "🔀 Routing query...",
+    "retriever":          "📂 Retrieving documents...",
+    "evaluate_retrieval": "📊 Evaluating retrieval...",
+    "rewrite_query":      "✏️ Rewriting query...",
+    "web_search":         "🌐 Searching the web...",
+    "generate_answer":    "✍️  Generating answer...",
+    "cache_store":        "💾 Caching result...",
 }
 
 
@@ -24,13 +29,20 @@ def _build_initial_state(query: str, chat_history: list, user_id: str = "public"
         "query":                query,
         "chat_history":         chat_history or [],
         "user_id":              user_id,
+        "guardrail_result":     "",
+        "guardrail_reason":     "",
         "retrieved_docs":       [],
         "target_sources":       [],
+        "original_query":       query,
+        "rewritten_query":      "",
+        "retrieval_attempts":   0,
+        "retrieval_confidence": 0.0,
         "answer":               "",
         "strategy":             "",
         "source_type":          "",
         "needs_web_search":     False,
         "web_search_attempted": False,
+        "cache_hit":            False,
         "timings":              {},   # Populated incrementally by each node
     }
 

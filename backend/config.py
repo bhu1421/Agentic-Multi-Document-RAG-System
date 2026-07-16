@@ -10,6 +10,8 @@ was chosen because it requires zero extra dependencies and is trivially
 importable from anywhere in the package.
 """
 
+import os
+
 # ── LLM ───────────────────────────────────────────────────────────────────────
 LLM_MODEL: str = "llama-3.1-8b-instant"   # Groq-hosted Llama model
 LLM_TEMPERATURE: float = 0.1               # Near-deterministic for routing + RAG
@@ -47,3 +49,16 @@ COLLECTION_NAME: str = "rag_collection" # Single shared collection name
 UPLOAD_DIR: str = "uploaded_docs"       # Staging area for uploaded files
 CLONED_REPOS_DIR: str = "cloned_repos"  # Staging area for cloned GitHub repos
 MAX_FILE_SIZE_MB: int = 50             # Per-file upload size limit
+
+# ── Guardrail ─────────────────────────────────────────────────────────────────
+GUARDRAIL_MAX_QUERY_LENGTH: int = 5000   # Reject queries longer than this (chars)
+GUARDRAIL_ENABLE_LLM_CHECK: bool = True  # Use LLM for off-topic detection
+
+# ── Query Rewriting ───────────────────────────────────────────────────────────
+RETRIEVAL_CONFIDENCE_THRESHOLD: float = 0.35  # Below this → rewrite + retry
+MAX_RETRIEVAL_ATTEMPTS: int = 1               # Max rewrite retries (1 = rewrite once)
+
+# ── Redis Cache ───────────────────────────────────────────────────────────────
+REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379")
+CACHE_TTL_SECONDS: int = 6 * 3600  # 6 hours
+CACHE_ENABLED: bool = os.getenv("CACHE_ENABLED", "true").lower() in {"1", "true", "yes"}

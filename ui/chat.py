@@ -85,6 +85,7 @@ BADGE_MAP = {
     "local":           ("📂 All Documents",    "badge-docs"),
     "web":             ("🌐 Web Search",       "badge-web"),
     "hybrid_web":      ("🌐 Web + Documents",  "badge-web"),
+    "cached":          ("⚡ Cached",           "badge-llm"),
 }
 
 
@@ -101,10 +102,15 @@ def _badge_class(badge_text: str) -> str:
 # ── Latency breakdown renderer ────────────────────────────────────────────────
 
 _NODE_DISPLAY_NAMES = {
-    "router":          "Router",
-    "retriever":       "Retriever",
-    "web_search":      "Web Search",
-    "generate_answer": "LLM",
+    "cache_check":        "Cache",
+    "guardrail":          "Guardrail",
+    "router":             "Router",
+    "retriever":          "Retriever",
+    "evaluate_retrieval": "Eval",
+    "rewrite_query":      "Rewrite",
+    "web_search":         "Web Search",
+    "generate_answer":    "LLM",
+    "cache_store":        "Cache Store",
 }
 
 
