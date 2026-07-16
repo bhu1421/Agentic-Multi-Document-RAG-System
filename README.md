@@ -62,19 +62,22 @@ docker compose up -d --build
 
 This is a production-grade Retrieval-Augmented Generation (RAG) system orchestrated by **LangGraph**.
 
-### 1. Intelligent Routing
+### 1. Guardrails & Caching
+Before any intensive processing, queries are checked against a Redis-backed cache to instantly return known answers. If no cache hits, a **Guardrail** node evaluates the query to block harmful, inappropriate, or out-of-scope requests.
+
+### 2. Intelligent Routing
 Every query passes through an LLM router (powered by Groq and Pydantic structured output) which classifies the intent into one of four paths:
 - `llm_knowledge` — Answer directly from the model's parametric knowledge.
 - `targeted_search` — Restrict search space to a specific named document.
 - `all_docs` — Perform semantic search across all indexed sources.
-- `web_search` — Fetch live, up-to-date results from DuckDuckGo.
+- `web_search` — Fetch live, up-to-date results using Tavily Search.
 
-### 2. Two-Stage Precision Retrieval
+### 3. Precision Retrieval & Self-Correction
 When searching your documents, the system employs a sophisticated pipeline:
-- **Stage 1 (Fast Recall):** Maximal Marginal Relevance (MMR) search retrieves up to 30 diverse candidate chunks from a local Qdrant vector database.
-- **Stage 2 (High Precision):** Hierarchical parent expansion restores the full document context (so the AI doesn't read fragmented sentences), followed by cross-encoder reranking (`BAAI/bge-reranker-large`) to precisely score and select the best context.
+- **Retrieval:** Maximal Marginal Relevance (MMR) search retrieves candidate chunks from a local Qdrant vector database, followed by hierarchical parent expansion and cross-encoder reranking.
+- **Evaluation:** The retrieved context is evaluated against the query. If the confidence is low, a **Query Rewriter** autonomously reformulates the question and retries the retrieval.
 
-### 3. Web Search Fallback Cycle
+### 4. Web Search Fallback Cycle
 If the system searches your documents and realizes the answer isn't there, it won't hallucinate. The LangGraph state machine will autonomously trigger a web search fallback cycle, browse the internet, and try again.
 
 ---
@@ -90,15 +93,24 @@ Streamlit UI (app.py)
         └── Chat Pipeline (LangGraph StateGraph)
                 │
                 ▼
-           [Router Node]  ← LLM + Pydantic structured output
+          [Cache Check] ──(hit)──► [END]
+                │(miss)
+                ▼
+          [Guardrails] ──(blocked)─► [END]
+                │(pass)
+                ▼
+           [Router Node]
                 │
      ┌──────────┼──────────┐
      ▼          ▼          ▼
-[Retriever] [WebSearch] [Generate]
-     │                     ▲
-     └─ MMR Search          │
-     └─ Parent Expansion    │
-     └─ Cross-Encoder ──────┘
+[Retriever] [WebSearch] [Generate] ──► [Cache Store] ──► [END]
+     │          │          ▲   │(fallback)
+     ▼          └──────────┘   └──► [WebSearch]
+ [Evaluate] ──(confident)──^
+     │
+   (low)
+     ▼
+ [Rewrite] ──► (retries Retriever)
 ```
 
 ---
@@ -108,20 +120,23 @@ Streamlit UI (app.py)
 ```text
 AGENTIC_RAG1/
 ├── app.py                    # Streamlit UI entry point
-├── docker-compose.yml        # Container orchestration
+├── docker-compose.yml        # Container orchestration (Redis + Qdrant + App)
 ├── Dockerfile                # Production-ready slim image
 ├── backend/
+│   ├── cache.py              # Redis caching logic
+│   ├── chunker.py            # Format-aware document chunking
 │   ├── config.py             # Single source of truth for all constants
 │   ├── graph.py              # LangGraph node definitions + compilation
-│   ├── rag.py                # Pipeline entry points
-│   ├── router.py             # Pydantic structured output router
-│   ├── retrieval.py          # MMR, parent expansion, reranker
-│   ├── vectordb.py           # Qdrant client, payload indices
-│   ├── chunker.py            # Format-aware document chunking
-│   ├── loader.py             # File and Web loaders
+│   ├── guardrail.py          # Input validation and guardrails
 │   ├── llm.py                # Groq LLM factory (lru_cache)
+│   ├── loader.py             # File and Web loaders
+│   ├── logger.py             # Centralised logging
+│   ├── rag.py                # Pipeline entry points
+│   ├── retrieval.py          # MMR, parent expansion, reranker
+│   ├── rewrite.py            # Query rewriting and self-correction
+│   ├── router.py             # Pydantic structured output router
 │   ├── state.py              # AgentState TypedDict
-│   └── logger.py             # Centralised logging
+│   └── vectordb.py           # Qdrant client, payload indices
 ├── ui/
 │   ├── chat.py               # Chat interface & streaming progress
 │   ├── sidebar.py            # File uploader, DB management
