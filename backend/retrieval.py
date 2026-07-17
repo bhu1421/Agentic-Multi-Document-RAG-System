@@ -202,3 +202,64 @@ def expand_to_parent_context(matched_docs, store, top_n_parents=config.MAX_PAREN
 
     # Cap to prevent blowing up the reranker / context window
     return expanded_docs[:config.MAX_EXPANDED_CHUNKS]
+
+
+# ──────────────────────────────────────────────
+# Hybrid Retrieval (Dense + BM25)
+# ──────────────────────────────────────────────
+
+def hybrid_retrieve(
+    query: str,
+    store,
+    target_sources: list[str] | None = None,
+    user_id: str | None = None,
+) -> list[Document]:
+    """Run dense + BM25 retrieval and fuse results with Reciprocal Rank Fusion.
+
+    Pipeline:
+    1. Dense search (Qdrant MMR) → TOP_K candidates
+    2. BM25 search (keyword matching) → BM25_TOP_K candidates
+    3. Reciprocal Rank Fusion → merged ranked list
+
+    If BM25 fails for any reason, falls back to dense-only results.
+
+    Args:
+        query: The user's search query.
+        store: The Qdrant vector store instance.
+        target_sources: Optional list of source names to filter by.
+        user_id: Optional user ID to scope the search.
+
+    Returns:
+        A fused, ranked list of Document objects.
+    """
+    from backend.bm25 import bm25_search, reciprocal_rank_fusion
+
+    metadata_filters = {"user_id": user_id} if user_id else None
+
+    # ── Dense retrieval (existing MMR pipeline) ───────────────────────────────
+    pipeline = build_retrieval_pipeline(store, target_sources, metadata_filters)
+    dense_docs = pipeline.invoke(query)
+    logger.info("[HybridSearch] Dense retrieved %d docs", len(dense_docs))
+
+    # ── BM25 retrieval ────────────────────────────────────────────────────────
+    try:
+        bm25_docs = bm25_search(
+            query=query,
+            store=store,
+            target_sources=target_sources,
+            user_id=user_id,
+        )
+        logger.info("[HybridSearch] BM25 retrieved %d docs", len(bm25_docs))
+    except Exception as exc:
+        logger.warning("[HybridSearch] BM25 search failed (%s) — using dense only", exc)
+        return dense_docs
+
+    # ── Reciprocal Rank Fusion ────────────────────────────────────────────────
+    if not bm25_docs:
+        return dense_docs
+    if not dense_docs:
+        return bm25_docs
+
+    fused = reciprocal_rank_fusion(dense_docs, bm25_docs)
+    return fused
+

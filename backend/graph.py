@@ -13,6 +13,7 @@ from backend.retrieval import (
     expand_to_parent_context,
     get_reranker,
     should_use_reranker,
+    hybrid_retrieve,
 )
 from backend.guardrail import guardrail_node
 from backend.rewrite import (
@@ -105,12 +106,17 @@ def retriever_node(state: AgentState):
     query = state["query"]
     target_sources = state.get("target_sources") or None
     source_type = state.get("source_type", "local")
+    user_id = state.get("user_id")
 
-    pipeline = build_retrieval_pipeline(store, target_sources, None)
-
+    # ── Hybrid search (Dense + BM25 + RRF) or dense-only ─────────────────────
     t_search = time.time()
-    raw_docs = pipeline.invoke(query)
-    logger.debug("[Retriever] Qdrant matched %d docs in %.1fs", len(raw_docs), time.time() - t_search)
+    if config.ENABLE_HYBRID_SEARCH:
+        raw_docs = hybrid_retrieve(query, store, target_sources, user_id)
+        logger.debug("[Retriever] Hybrid search returned %d docs in %.1fs", len(raw_docs), time.time() - t_search)
+    else:
+        pipeline = build_retrieval_pipeline(store, target_sources, None)
+        raw_docs = pipeline.invoke(query)
+        logger.debug("[Retriever] Dense-only matched %d docs in %.1fs", len(raw_docs), time.time() - t_search)
 
     expanded_docs = expand_to_parent_context(raw_docs, store, user_id=state.get("user_id"))
 

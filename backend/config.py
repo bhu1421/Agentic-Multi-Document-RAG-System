@@ -62,3 +62,8 @@ MAX_RETRIEVAL_ATTEMPTS: int = 1               # Max rewrite retries (1 = rewrite
 REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379")
 CACHE_TTL_SECONDS: int = 6 * 3600  # 6 hours
 CACHE_ENABLED: bool = os.getenv("CACHE_ENABLED", "true").lower() in {"1", "true", "yes"}
+
+# ── Hybrid Search (BM25 + Dense) ─────────────────────────────────────────────
+ENABLE_HYBRID_SEARCH: bool = True   # Fuse BM25 keyword search with dense retrieval
+BM25_TOP_K: int = 30                # Candidates returned by BM25 (matches dense TOP_K)
+RRF_K: int = 60                     # Reciprocal Rank Fusion constant (standard value)
