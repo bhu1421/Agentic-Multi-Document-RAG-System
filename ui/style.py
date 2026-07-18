@@ -85,5 +85,66 @@ def apply_custom_styles():
         #MainMenu {visibility: hidden;}
         header {visibility: hidden;}
         footer {visibility: hidden;}
+
+        /* ── Confidence bar ──────────────────────────────────────────────── */
+        .confidence-wrap {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin: 6px 0 2px 0;
+        }
+        .confidence-label {
+            font-size: 0.72rem;
+            color: #64748b;
+            white-space: nowrap;
+        }
+        .confidence-track {
+            flex: 1;
+            max-width: 120px;
+            height: 5px;
+            background: rgba(255,255,255,0.08);
+            border-radius: 99px;
+            overflow: hidden;
+        }
+        .confidence-fill {
+            height: 100%;
+            border-radius: 99px;
+            transition: width 0.4s ease;
+        }
+        .confidence-text {
+            font-size: 0.72rem;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+
+        /* ── Follow-up chips ─────────────────────────────────────────────── */
+        .followup-header {
+            font-size: 0.78rem;
+            color: #94a3b8;
+            font-weight: 500;
+            margin: 14px 0 6px 0;
+            letter-spacing: 0.02em;
+        }
+        /* Override default Streamlit button style for follow-up chips */
+        div[data-testid="stHorizontalBlock"] .stButton > button {
+            background: rgba(99, 102, 241, 0.07);
+            border: 1px solid rgba(99, 102, 241, 0.25);
+            border-radius: 20px;
+            color: #a5b4fc;
+            font-size: 0.78rem;
+            font-weight: 400;
+            padding: 4px 14px;
+            transition: all 0.2s ease;
+            white-space: normal;
+            text-align: left;
+            line-height: 1.3;
+            min-height: unset;
+        }
+        div[data-testid="stHorizontalBlock"] .stButton > button:hover {
+            background: rgba(99, 102, 241, 0.18);
+            border-color: rgba(99, 102, 241, 0.5);
+            color: #c7d2fe;
+            box-shadow: 0 0 14px rgba(99, 102, 241, 0.2);
+        }
     </style>
     """, unsafe_allow_html=True)

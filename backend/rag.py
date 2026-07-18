@@ -105,6 +105,8 @@ def stream_agentic_response(
     timings = final.get("timings", {})
     elapsed = time.time() - total_start
 
+    confidence = final.get("retrieval_confidence", 0.0)
+
     logger.info(
         "[Stream] session=%s  %.1fs  source=%s  docs=%d  timings=%s",
         session_id, elapsed, source_type, len(docs), timings,
@@ -112,10 +114,11 @@ def stream_agentic_response(
 
     yield ("answer", answer)
     yield ("meta", {
-        "source_type": source_type,
-        "docs":        docs,
-        "elapsed":     elapsed,
-        "timings":     timings,
+        "source_type":          source_type,
+        "docs":                 docs,
+        "elapsed":              elapsed,
+        "timings":              timings,
+        "retrieval_confidence": confidence,
     })
 
 
@@ -151,3 +154,42 @@ def get_agentic_response(
     )
 
     return {"answer": answer, "context": docs, "source_type": source_type, "timings": timings}
+
+
+def generate_followup_questions(query: str, answer: str) -> list:
+    """Generate 3 short follow-up questions from a Q&A pair using the LLM.
+
+    Called after the main pipeline completes. Uses a minimal prompt to keep
+    latency low (< 0.5 s on Groq). Returns a list of up to 3 question strings,
+    or an empty list if the LLM call fails.
+    """
+    from backend.llm import get_llm
+    from langchain_core.prompts import ChatPromptTemplate
+
+    llm = get_llm()
+    prompt = ChatPromptTemplate.from_messages([
+        ("system",
+         "You are a helpful assistant. Given a question and its answer, produce exactly "
+         "3 short follow-up questions a curious user might ask next.\n"
+         "Rules:\n"
+         "1. Each question must be on its own line starting with '- '.\n"
+         "2. Keep each question under 12 words.\n"
+         "3. Make them genuinely useful and different from each other.\n"
+         "4. Return ONLY the 3 lines — no intro, no numbering, no extra text."),
+        ("human", "Question: {query}\n\nAnswer (summary): {answer}"),
+    ])
+
+    try:
+        result = (prompt | llm).invoke({
+            "query":  query,
+            "answer": answer[:600],   # truncate long answers to keep prompt small
+        })
+        lines = [
+            line.lstrip("- ").strip()
+            for line in result.content.strip().splitlines()
+            if line.strip().startswith("-")
+        ]
+        return lines[:3]
+    except Exception as exc:
+        logger.warning("[Followup] Generation failed: %s", exc)
+        return []

@@ -51,30 +51,45 @@ def render_chat_interface():
             </div>
             """, unsafe_allow_html=True)
 
-        for msg in st.session_state.messages:
+        for idx, msg in enumerate(st.session_state.messages):
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
-                badge = msg.get("source_badge", "")
-                if badge:
-                    badge_class = _badge_class(badge)
-                    st.markdown(
-                        f'<span class="source-badge {badge_class}">{badge}</span>',
-                        unsafe_allow_html=True,
-                    )
-                # Show stored latency breakdown for historical messages
-                if msg.get("timings"):
-                    _render_latency(msg["timings"], msg.get("elapsed", 0))
+                if msg["role"] == "assistant":
+                    badge = msg.get("source_badge", "")
+                    if badge:
+                        badge_class = _badge_class(badge)
+                        st.markdown(
+                            f'<span class="source-badge {badge_class}">{badge}</span>',
+                            unsafe_allow_html=True,
+                        )
+                    # Confidence badge for historical messages
+                    if msg.get("retrieval_confidence") is not None:
+                        _render_confidence_badge(
+                            msg["retrieval_confidence"], msg.get("source_type", "")
+                        )
+                    # Latency breakdown for historical messages
+                    if msg.get("timings"):
+                        _render_latency(msg["timings"], msg.get("elapsed", 0))
+                    # Follow-up chips for historical messages
+                    if msg.get("followups"):
+                        _render_followup_chips(msg["followups"], key_prefix=f"hist_{idx}")
 
-    # ── Chat input ────────────────────────────────────────────────────────────
-    if prompt := st.chat_input("Ask a question across all your documents..."):
-        st.session_state.messages.append({"role": "user", "content": prompt})
+    # ── Chat input + follow-up routing ───────────────────────────────────────
+    # Render the chat input box (always visible)
+    chat_input = st.chat_input("Ask a question across all your documents...")
+
+    # A follow-up button click stores the question here; it takes priority
+    prompt_to_run = st.session_state.pop("pending_followup", None) or chat_input
+
+    if prompt_to_run:
+        st.session_state.messages.append({"role": "user", "content": prompt_to_run})
 
         with chat_container:
             with st.chat_message("user"):
-                st.markdown(prompt)
+                st.markdown(prompt_to_run)
 
             with st.chat_message("assistant"):
-                _handle_query(prompt)
+                _handle_query(prompt_to_run)
 
 
 # ── Badge helpers ─────────────────────────────────────────────────────────────
@@ -97,6 +112,37 @@ def _badge_class(badge_text: str) -> str:
     if "Web" in badge_text or "web" in badge_text.lower():
         return "badge-web"
     return "badge-docs"
+
+
+# ── Confidence badge renderer ─────────────────────────────────────────────────
+
+def _render_confidence_badge(confidence: float, source_type: str):
+    """Render a horizontal progress bar showing retrieval confidence (0–1).
+
+    Only shown for document-based retrievals where a meaningful confidence
+    score was produced by the cross-encoder or count heuristic.
+    """
+    if source_type not in {"local", "targeted_search"} or confidence <= 0:
+        return
+
+    if confidence >= 0.65:
+        color, label = "#22c55e", "High"
+    elif confidence >= 0.35:
+        color, label = "#f59e0b", "Medium"
+    else:
+        color, label = "#ef4444", "Low"
+
+    pct = int(confidence * 100)
+    st.markdown(
+        f'<div class="confidence-wrap">'
+        f'  <span class="confidence-label">Confidence</span>'
+        f'  <div class="confidence-track">'
+        f'    <div class="confidence-fill" style="width:{pct}%;background:{color};"></div>'
+        f'  </div>'
+        f'  <span class="confidence-text" style="color:{color};">{label} {pct}%</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
 
 
 # ── Latency breakdown renderer ────────────────────────────────────────────────
@@ -127,11 +173,31 @@ def _render_latency(timings: dict, total: float):
         st.caption(f"⏱️ {total:.1f}s total  ·  " + "  ·  ".join(parts))
 
 
+# ── Follow-up chips renderer ──────────────────────────────────────────────────
+
+def _render_followup_chips(followups: list, key_prefix: str):
+    """Render follow-up questions as pill-style chip buttons in a row.
+
+    When a chip is clicked, the question is stored in pending_followup and
+    a rerun is triggered so render_chat_interface picks it up as the next query.
+    """
+    if not followups:
+        return
+
+    st.markdown('<div class="followup-header">💡 You might also ask</div>', unsafe_allow_html=True)
+    cols = st.columns(len(followups))
+    for i, (col, question) in enumerate(zip(cols, followups)):
+        with col:
+            if st.button(question, key=f"{key_prefix}_fu_{i}", use_container_width=True):
+                st.session_state.pending_followup = question
+                st.rerun()
+
+
 # ── Core query handler ────────────────────────────────────────────────────────
 
 def _handle_query(prompt: str):
     """Run the agentic pipeline with live streaming progress, then render the answer."""
-    from backend.rag import stream_agentic_response
+    from backend.rag import stream_agentic_response, generate_followup_questions
 
     chat_history = st.session_state.messages[:-1]
     session_id   = st.session_state.session_id
@@ -198,7 +264,7 @@ def _handle_query(prompt: str):
 
     # ── Render answer ─────────────────────────────────────────────────────────
     # The answer was already streamed live into answer_placeholder above.
-    # We only need to render the badge and latency below it.
+    # Render badge, confidence, latency, and sources below it.
 
     source_type = meta.get("source_type", "")
     badge_text, badge_class = BADGE_MAP.get(source_type, ("📂 Documents", "badge-docs"))
@@ -206,6 +272,10 @@ def _handle_query(prompt: str):
         f'<span class="source-badge {badge_class}">{badge_text}</span>',
         unsafe_allow_html=True,
     )
+
+    # ── Confidence badge ──────────────────────────────────────────────────────
+    confidence = meta.get("retrieval_confidence", 0.0)
+    _render_confidence_badge(confidence, source_type)
 
     # ── Latency breakdown ─────────────────────────────────────────────────────
     timings = meta.get("timings", {})
@@ -226,11 +296,20 @@ def _handle_query(prompt: str):
                 if i < len(docs) - 1:
                     st.markdown("---")
 
+    # ── Follow-up questions ───────────────────────────────────────────────────
+    followups = generate_followup_questions(prompt, answer)
+    msg_idx   = len(st.session_state.messages)   # index of the message we're about to append
+    _render_followup_chips(followups, key_prefix=f"new_{msg_idx}")
+
+    # ── Save to history ───────────────────────────────────────────────────────
     st.session_state.messages.append({
-        "role":         "assistant",
-        "content":      answer,
-        "source_badge": badge_text,
-        "context":      docs,
-        "timings":      timings,
-        "elapsed":      elapsed,
+        "role":                 "assistant",
+        "content":              answer,
+        "source_badge":         badge_text,
+        "source_type":          source_type,
+        "context":              docs,
+        "timings":              timings,
+        "elapsed":              elapsed,
+        "retrieval_confidence": confidence,
+        "followups":            followups,
     })
