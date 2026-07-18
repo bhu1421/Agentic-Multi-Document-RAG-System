@@ -140,6 +140,10 @@ def _handle_query(prompt: str):
     meta      = {}
     had_error = False
 
+    # Placeholder for the live-streamed answer (sits below the status box)
+    answer_placeholder = st.empty()
+    streaming_text     = ""
+
     # ── Live step-by-step progress ────────────────────────────────────────────
     with st.status("🔍 Thinking...", expanded=True) as status:
         try:
@@ -149,9 +153,22 @@ def _handle_query(prompt: str):
                     label = NODE_LABELS.get(data, f"⚙️ {data}...")
                     status.update(label=label)
 
+                elif event_type == "token":
+                    # Append token and refresh the placeholder with a blinking cursor
+                    streaming_text += data
+                    answer_placeholder.markdown(streaming_text + " ▌")
+
                 elif event_type == "answer":
                     answer = data
-                    status.update(label="✍️  Writing answer...")
+                    if answer:
+                        # Final answer — remove the cursor and show clean text
+                        answer_placeholder.markdown(answer)
+                        status.update(label="✍️  Writing answer...")
+                    else:
+                        # Empty answer means INSUFFICIENT_CONTEXT → web retry incoming.
+                        # Clear the placeholder so the next token stream starts fresh.
+                        streaming_text = ""
+                        answer_placeholder.empty()
 
                 elif event_type == "meta":
                     meta = data
@@ -180,7 +197,8 @@ def _handle_query(prompt: str):
         return
 
     # ── Render answer ─────────────────────────────────────────────────────────
-    st.markdown(answer)
+    # The answer was already streamed live into answer_placeholder above.
+    # We only need to render the badge and latency below it.
 
     source_type = meta.get("source_type", "")
     badge_text, badge_class = BADGE_MAP.get(source_type, ("📂 Documents", "badge-docs"))

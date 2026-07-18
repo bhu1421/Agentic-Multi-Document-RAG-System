@@ -199,12 +199,16 @@ def answer_node(state: AgentState):
     Hallucination guard: when using local documents, the prompt instructs the
     LLM to output exactly 'INSUFFICIENT_CONTEXT' if the retrieved chunks do not
     contain the answer.  The graph then routes to a web search fallback.
+
+    Token streaming: if state["token_queue"] is set, each streamed token chunk
+    is pushed into the queue so the UI can display it in real-time.
     """
     t = time.time()
     llm = get_llm()
     query = state["query"]
     chat_history = state.get("chat_history", [])
     docs = state.get("retrieved_docs", [])
+    token_queue = state.get("token_queue")  # queue.SimpleQueue | None
 
     history_str = (
         "Chat History:\n"
@@ -215,6 +219,19 @@ def answer_node(state: AgentState):
         + "\n\n"
     ) if chat_history else ""
 
+    # ── Helper: stream a chain and push tokens to queue ───────────────────────
+    def _stream_chain(chain, inputs: dict) -> str:
+        """Invoke *chain* in streaming mode, push each text chunk to token_queue,
+        and return the fully-joined answer string."""
+        chunks = []
+        for chunk in chain.stream(inputs):
+            text = chunk.content if hasattr(chunk, "content") else str(chunk)
+            if text:
+                chunks.append(text)
+                if token_queue is not None:
+                    token_queue.put(text)
+        return "".join(chunks)
+
     # ── No documents retrieved → answer from LLM knowledge ───────────────────
     if not docs:
         current_date = datetime.now().strftime("%B %d, %Y")
@@ -224,7 +241,7 @@ def answer_node(state: AgentState):
                        f"Be helpful and concise.\n\n{{history_str}}"),
             ("human", "{input}"),
         ])
-        answer = (prompt | llm).invoke({"input": query, "history_str": history_str}).content
+        answer = _stream_chain(prompt | llm, {"input": query, "history_str": history_str})
         return {
             "answer": answer,
             "needs_web_search": False,
@@ -261,11 +278,11 @@ def answer_node(state: AgentState):
         ("human", "{input}"),
     ])
 
-    answer = (prompt | llm).invoke({
+    answer = _stream_chain(prompt | llm, {
         "input": query,
         "history_str": history_str,
         "context": context,
-    }).content
+    })
 
     # ── Insufficient context guard → trigger web search fallback ──────────────
     if "INSUFFICIENT_CONTEXT" in answer and state.get("source_type") not in {"web", "hybrid_web"}:

@@ -1,4 +1,4 @@
-from typing import List, TypedDict
+from typing import Any, List, TypedDict
 from langchain_core.documents import Document
 
 
@@ -45,3 +45,9 @@ class AgentState(TypedDict):
     # Nodes must READ the current dict and ADD their key to avoid overwriting
     # siblings (LangGraph merges returned dicts by replacing keys, not deep-merging).
     timings: dict
+
+    # ── Streaming ─────────────────────────────────────────────────────────────
+    # Optional queue.SimpleQueue passed from stream_agentic_response so that
+    # answer_node can push individual token strings into it for real-time display.
+    # None when streaming is not required (e.g. get_agentic_response).
+    token_queue: Any

@@ -29,6 +29,61 @@ def check_empty(query: str, **_kwargs) -> tuple[bool, str]:
     return False, ""
 
 
+# ── Conversational / Greeting Patterns ───────────────────────────────────────
+# Short greetings and casual messages should always pass through so the LLM
+# can respond naturally — no LLM off-topic check needed for these.
+
+_GREETING_WORDS = re.compile(
+    r"^\s*(hi|hello|hey|howdy|greetings|sup|yo|hiya)[!.,?\s]",
+    re.IGNORECASE,
+)
+
+_GREETING_PATTERNS = re.compile(
+    r"^\s*("
+    r"hi|hello|hey|howdy|greetings|sup|yo|hiya|"           # greetings
+    r"good\s+(morning|afternoon|evening|night)|"            # time greetings
+    r"how\s+are\s+you|how\s+r\s+u|how\s+do\s+you\s+do|"  # pleasantries
+    r"(i\s+(am|'m)|my\s+name\s+is|call\s+me|i\s+go\s+by)\s+\w+|"  # intros
+    r"what('s|\s+is)\s+your\s+name|who\s+are\s+you|"      # identity questions
+    r"thanks?|thank\s+you|thx|ty|cheers|"                  # gratitude
+    r"ok|okay|sure|alright|cool|great|nice|wow|"           # acknowledgements
+    r"bye|goodbye|see\s+you|later|cya"                      # farewells
+    r")[!.,?\s]*$",
+    re.IGNORECASE,
+)
+
+
+def check_conversational(query: str, **_kwargs) -> tuple[bool, str]:
+    """Allow short conversational/greeting messages to pass without LLM check.
+
+    Queries that match greeting/casual patterns are guaranteed NOT to be
+    blocked as off-topic — the LLM will respond naturally to them.
+    This check always returns (False, '') meaning 'not blocked'.
+    It is added to the CHECKS list BEFORE check_off_topic so that matched
+    queries set a pass-flag that prevents the LLM check from running.
+    """
+    stripped = query.strip()
+
+    # Very short queries (≤20 chars) → fast pass (no LLM check needed)
+    if len(stripped) <= 20:
+        logger.info("[Guardrail] Short query (%d chars) — fast pass", len(stripped))
+        return False, ""
+
+    # Queries that start with a greeting word → fast pass
+    # Catches: "hey i am bhuvan", "hi, what do you know about...", etc.
+    if _GREETING_WORDS.match(stripped):
+        logger.info("[Guardrail] Greeting-prefixed query — fast pass")
+        return False, ""
+
+    # Personal intro patterns → fast pass
+    if _GREETING_PATTERNS.match(stripped):
+        logger.info("[Guardrail] Greeting-style intro query — fast pass")
+        return False, ""
+
+    return False, ""
+
+
+
 def check_length(query: str, **_kwargs) -> tuple[bool, str]:
     """Reject queries exceeding the configured character limit."""
     max_len = config.GUARDRAIL_MAX_QUERY_LENGTH
@@ -145,7 +200,8 @@ def check_off_topic(query: str, llm=None, **_kwargs) -> tuple[bool, str]:
 
     Only runs when config.GUARDRAIL_ENABLE_LLM_CHECK is True and an LLM
     instance is provided.  Returns (True, reason) if the query is a task
-    request unrelated to document analysis or knowledge retrieval.
+    request unrelated to document analysis, knowledge retrieval, OR
+    general conversation.
     """
     if not config.GUARDRAIL_ENABLE_LLM_CHECK or llm is None:
         return False, ""
@@ -158,24 +214,30 @@ def check_off_topic(query: str, llm=None, **_kwargs) -> tuple[bool, str]:
         """Structured output for off-topic detection."""
         verdict: Literal["relevant", "off_topic"] = Field(
             description=(
-                "relevant — the query is about documents, knowledge, information, "
-                "research, analysis, summarisation, or general knowledge questions. "
-                "off_topic — the query is a task/action request completely unrelated "
-                "to knowledge retrieval, such as writing recipes, composing poems, "
-                "generating code from scratch, role-playing, etc."
+                "relevant — the query is a general knowledge question, a document/research "
+                "question, a greeting, a casual conversation message, a personal introduction, "
+                "or anything a helpful AI assistant would normally respond to. "
+                "off_topic — ONLY flag this if the query explicitly demands a harmful, "
+                "purely creative-fiction task (e.g. write me a poem about dragons), or "
+                "a very specific unrelated action (e.g. write a recipe for cake). "
+                "When in doubt, choose relevant."
             )
         )
 
     prompt = ChatPromptTemplate.from_messages([
         ("system",
-         "You are a query classifier for a document Q&A system. "
-         "Decide if the user's query is RELEVANT to document analysis, "
-         "knowledge retrieval, research questions, or general knowledge — "
-         "or if it is an OFF-TOPIC task request like writing recipes, "
-         "composing creative fiction, role-playing, etc.\n\n"
-         "IMPORTANT: General knowledge questions (e.g. 'What is machine learning?', "
-         "'Explain quantum physics') ARE relevant. Only flag purely unrelated "
-         "task/action requests as off_topic."),
+         "You are a lenient query classifier for an AI assistant. "
+         "Your job is to decide if a query should be BLOCKED.\n\n"
+         "Mark as RELEVANT (do NOT block):\n"
+         "- Greetings and casual conversation ('hi', 'hello', 'how are you')\n"
+         "- Personal introductions ('I am Bhuvan', 'my name is ...')\n"
+         "- General knowledge questions ('what is ML?', 'explain Python')\n"
+         "- Document/research questions\n"
+         "- Anything a normal AI assistant would helpfully answer\n\n"
+         "Mark as OFF_TOPIC (block) ONLY IF:\n"
+         "- The user asks for something clearly harmful\n"
+         "- The user demands an unrelated creative task the assistant obviously cannot help with\n\n"
+         "DEFAULT TO RELEVANT. Only block when you are very sure."),
         ("human", "{query}"),
     ])
 
@@ -203,7 +265,8 @@ CHECKS = [
     check_spam,
     check_prompt_injection,
     check_malicious,
-    check_off_topic,        # LLM-based — runs last
+    check_conversational,   # Fast-pass greetings/casual — runs before LLM check
+    check_off_topic,        # LLM-based — runs last (skipped for conversational queries)
 ]
 
 

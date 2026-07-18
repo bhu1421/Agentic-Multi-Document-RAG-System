@@ -1,4 +1,5 @@
 import time
+import queue as _queue
 from typing import Generator
 from backend.graph import compile_graph
 from backend.logger import get_logger
@@ -19,7 +20,7 @@ NODE_LABELS: dict[str, str] = {
 }
 
 
-def _build_initial_state(query: str, chat_history: list, user_id: str = "public") -> dict:
+def _build_initial_state(query: str, chat_history: list, user_id: str = "public", token_queue=None) -> dict:
     """Construct a fully-initialised AgentState dict.
 
     Every key defined in AgentState must be present here.
@@ -44,6 +45,7 @@ def _build_initial_state(query: str, chat_history: list, user_id: str = "public"
         "web_search_attempted": False,
         "cache_hit":            False,
         "timings":              {},   # Populated incrementally by each node
+        "token_queue":          token_queue,  # queue.SimpleQueue | None
     }
 
 
@@ -61,23 +63,36 @@ def stream_agentic_response(
 
     Yields tuples of (event_type, data):
         ("node",   node_name: str)    — fired after each graph node completes
-        ("answer", answer_text: str)  — the final generated answer
+        ("token",  text: str)         — individual LLM token chunk (streamed live)
+        ("answer", answer_text: str)  — the complete final answer
         ("meta",   meta_dict: dict)   — source_type, docs, elapsed, timings
         ("error",  message: str)      — if the pipeline crashes
     """
     total_start = time.time()
-    initial_state = _build_initial_state(query, chat_history, user_id)
+
+    # Create the shared queue that answer_node will push token chunks into
+    token_q = _queue.SimpleQueue()
+
+    initial_state = _build_initial_state(query, chat_history, user_id, token_queue=token_q)
     final = initial_state.copy()
     graph = compile_graph()
 
     try:
-        # graph.stream with stream_mode="updates" yields:
-        #   {"node_name": {partial_state_update}} for each completed node.
         for chunk in graph.stream(initial_state, stream_mode="updates"):
             node_name = next(iter(chunk))
             updates = chunk[node_name]
             final.update(updates)
             yield ("node", node_name)
+
+            # After generate_answer completes, drain all tokens the node pushed
+            # into the queue and forward them to the UI layer.
+            if node_name == "generate_answer":
+                while True:
+                    try:
+                        tok = token_q.get_nowait()
+                        yield ("token", tok)
+                    except _queue.Empty:
+                        break
 
     except Exception:
         logger.exception("[Stream] Pipeline failed for session '%s'", session_id)
